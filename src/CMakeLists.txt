@@ -27,6 +27,7 @@ add_library(llama
             llama-kv-cache-dsa.cpp
             llama-kv-cache-dsv4.cpp
             llama-memory.cpp
+            llama-triattention.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
