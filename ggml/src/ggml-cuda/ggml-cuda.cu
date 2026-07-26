@@ -118,16 +118,6 @@ static int ggml_cuda_get_physical_device(int device) {
 
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
-// Forward declarations for host-staged cross-GPU copy helpers
-// (used by buffer ops before their definition site).
-static cudaError_t ggml_cuda_copy_across_devices(
-    void * dst, int dst_device, const void * src, int src_device,
-    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream);
-static cudaError_t ggml_cuda_copy2d_across_devices(
-    void * dst, int dst_device, size_t dpitch,
-    const void * src, int src_device, size_t spitch,
-    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream);
-
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
@@ -1951,7 +1941,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S) {
         return true;
     }
 
@@ -2641,7 +2631,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-        const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
