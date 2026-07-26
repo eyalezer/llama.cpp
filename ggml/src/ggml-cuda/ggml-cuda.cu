@@ -117,16 +117,6 @@ static int ggml_cuda_get_physical_device(int device) {
 
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
-// Forward declarations for host-staged cross-GPU copy helpers
-// (used by buffer ops before their definition site).
-static cudaError_t ggml_cuda_copy_across_devices(
-    void * dst, int dst_device, const void * src, int src_device,
-    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream);
-static cudaError_t ggml_cuda_copy2d_across_devices(
-    void * dst, int dst_device, size_t dpitch,
-    const void * src, int src_device, size_t spitch,
-    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream);
-
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);

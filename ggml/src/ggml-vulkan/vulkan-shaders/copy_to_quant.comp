@@ -498,7 +498,9 @@ void main() {
         data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
     }
 }
+
 #elif defined(SET_ROWS) && defined(DATA_A_TURBO2_0)
+
 // Mirror of the TURBO3_0 block above, adapted for turbo2 (4 centroids,
 // 2-bit pack, no signs byte). WHT tables and reduction structure are
 // identical (QK = 128 for both).
@@ -610,6 +612,7 @@ void main() {
 }
 
 #elif defined(SET_ROWS) && defined(DATA_A_TURBO4_0)
+
 // Mirror of the TURBO3_0 block above, adapted for turbo4 (16 centroids,
 // 4-bit nibble pack, no signs byte). WHT tables and reduction structure
 // are identical (QK = 128 for both).
