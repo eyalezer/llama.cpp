@@ -12,7 +12,7 @@
 // illegal to return from / pass to functions. Macros expand inline where the
 // float16 stays in storage and is converted to FLOAT_TYPE at use.
 
-#if !defined(DATA_A_TURBO3_0)
+#if !defined(DATA_A_TURBO2_0) && !defined(DATA_A_TURBO3_0) && !defined(DATA_A_TURBO4_0)
 // F32 is fed as a vec4 "block" (4 floats), matching what dequant_funcs_cm2.glsl
 // does for F32 in the cm2 shader. FaBlockBytesK/V == 16 for F32.
 layout (binding = 1) readonly buffer K_PACKED_F32  { vec4 data[]; }                k_packed_f32;
@@ -138,10 +138,10 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     const float c[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);                        \
     const float norm = float(BUF.data[a_offset + ib].norm);                                       \
     const uint qs_byte = uint(BUF.data[a_offset + ib].qs[iqs / 4]);                               \
-    const uint i0 = (qs_byte     ) & 0x3u;                                                         \
-    const uint i1 = (qs_byte >> 2) & 0x3u;                                                         \
-    const uint i2 = (qs_byte >> 4) & 0x3u;                                                         \
-    const uint i3 = (qs_byte >> 6) & 0x3u;                                                         \
+    const uint i0 = (qs_byte     ) & 0x3u;                                                        \
+    const uint i1 = (qs_byte >> 2) & 0x3u;                                                        \
+    const uint i2 = (qs_byte >> 4) & 0x3u;                                                        \
+    const uint i3 = (qs_byte >> 6) & 0x3u;                                                        \
     return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                           \
 }
 
@@ -169,46 +169,46 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     const float c[16] = float[16](                                                                \
         -0.241529, -0.182877, -0.143016, -0.111036,                                               \
         -0.083292, -0.058050, -0.034299, -0.011349,                                               \
-         0.011349,  0.034299,  0.058050,  0.083292,                                                \
+         0.011349,  0.034299,  0.058050,  0.083292,                                               \
          0.111036,  0.143016,  0.182877,  0.241529);                                              \
     const float norm = float(BUF.data[a_offset + ib].norm);                                       \
     const uint b0 = uint(BUF.data[a_offset + ib].qs[iqs / 2    ]);                                \
     const uint b1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + 1]);                                \
-    const uint i0 = (b0     ) & 0xFu;                                                              \
-    const uint i1 = (b0 >> 4) & 0xFu;                                                              \
-    const uint i2 = (b1     ) & 0xFu;                                                              \
-    const uint i3 = (b1 >> 4) & 0xFu;                                                              \
+    const uint i0 = (b0     ) & 0xFu;                                                             \
+    const uint i1 = (b0 >> 4) & 0xFu;                                                             \
+    const uint i2 = (b1     ) & 0xFu;                                                             \
+    const uint i3 = (b1 >> 4) & 0xFu;                                                             \
     return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                           \
 }
 
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
         switch (FaTypeK) {
-            case FA_TYPE_F32:  FA_DEQUANT4_F32 (k_packed_f32)
-            case FA_TYPE_Q4_0: FA_DEQUANT4_Q4_0(k_packed_q4_0)
-            case FA_TYPE_Q4_1: FA_DEQUANT4_Q4_1(k_packed_q4_1)
-            case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0)
-            case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
-            case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
+            case FA_TYPE_F32:  FA_DEQUANT4_F32 (k_packed_f32);
+            case FA_TYPE_Q4_0: FA_DEQUANT4_Q4_0(k_packed_q4_0);
+            case FA_TYPE_Q4_1: FA_DEQUANT4_Q4_1(k_packed_q4_1);
+            case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0);
+            case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1);
+            case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0);
             case FA_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(k_packed_iq4_nl)
-            case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
-            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0)
-            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)
-            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)
+            case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16);
+            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0);
+            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0);
+            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0);
         }
     } else {
         switch (FaTypeV) {
-            case FA_TYPE_F32:  FA_DEQUANT4_F32 (v_packed_f32)
-            case FA_TYPE_Q4_0: FA_DEQUANT4_Q4_0(v_packed_q4_0)
-            case FA_TYPE_Q4_1: FA_DEQUANT4_Q4_1(v_packed_q4_1)
-            case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0)
-            case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
-            case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
+            case FA_TYPE_F32:  FA_DEQUANT4_F32 (v_packed_f32);
+            case FA_TYPE_Q4_0: FA_DEQUANT4_Q4_0(v_packed_q4_0);
+            case FA_TYPE_Q4_1: FA_DEQUANT4_Q4_1(v_packed_q4_1);
+            case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0);
+            case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1);
+            case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0);
             case FA_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(v_packed_iq4_nl)
-            case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
-            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0)
-            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)
-            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)
+            case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16);
+            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0);
+            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0);
+            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0);
         }
     }
     return FLOAT_TYPEV4(0);
