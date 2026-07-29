@@ -6865,6 +6865,70 @@ struct test_turbo_wht_roundtrip : public test_case {
     }
 };
 
+// Test SET_ROWS with turbo2 destination, then dequantize and compare.
+// Mirrors test_set_rows_turbo3/turbo4 for the 2-bit PolarQuant type: f32 -> WHT ->
+// 4-centroid quantize -> turbo2, then turbo2 -> f32, compared against the CPU backend.
+struct test_set_rows_turbo2 : public test_case {
+    const ggml_type type_idx;
+    const int64_t ne0; // head dim (must be multiple of 128)
+    const int64_t ne1; // rows in dst
+    const int r;       // rows to write
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_TURBO2";
+    }
+
+    test_set_rows_turbo2(ggml_type type_idx = GGML_TYPE_I32,
+            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // dst: the turbo2 KV cache buffer
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO2_0, ne0, ne1);
+        ggml_set_name(dst, "dst");
+
+        // src: f32 values to quantize into the cache
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+
+        // row indices
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
+        ggml_set_name(row_idxs, "row_idxs");
+
+        // Write f32 data into turbo2 dst via SET_ROWS (includes WHT + quantize)
+        ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
+
+        // Read it back by dequantizing the written rows to f32
+        ggml_tensor * out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) continue;
+                init_set_rows_row_ids(t, ne1);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // turbo2 is 2-bit quantization (4 centroids) with WHT rotation, coarser
+        // than turbo3's 3-bit/8-centroid scheme, so its round-trip error is
+        // higher. Bound is a first estimate; tighten once empirical numbers
+        // are available from a passing run.
+        return 0.12;
+    }
+};
+
 // Test SET_ROWS with turbo3 destination, then dequantize and compare.
 // This validates the full quantization pipeline: f32 -> WHT -> PolarQuant -> turbo3
 // followed by dequantization: turbo3 -> f32. The round-trip error should be bounded.
@@ -8384,6 +8448,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // NOTE: turbo2/turbo3/turbo4 do not implement GGML_OP_GET_ROWS on the CPU
+    // backend (ggml-cpu/ops.cpp: ggml_compute_forward_get_rows hits the
+    // default case and GGML_ABORTs) -- confirmed empirically while adding
+    // this test. Real KV-cache reads for turbo types go through MUL_MAT
+    // (vec_dot_turboX_0_f32 is registered), not GET_ROWS, so a GET_ROWS test
+    // here would not reflect real usage. See test_mul_mat turbo cases below
+    // for the non-FA multi-row analog instead.
     for (int b : {1, 7}) {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
@@ -9126,6 +9197,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MUL_MAT with turbo K/V-cache types as type_a: dequantizes multiple rows
+    // via vec_dot_turboX_0_f32 for a batch of n query rows in one dispatch,
+    // the non-FA analog of FLASH_ATTN_EXT's nb>1 case (Bug #3). Not in
+    // base_types/all_types (turbo types are WHT-rotated-domain KV-cache-only
+    // types not meant for generic weight mul_mat), so exercised explicitly
+    // here with n = 1 (decode) and n > 1 (prefill/batched, the failure mode).
+    for (ggml_type type_a : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (int64_t n : {1, 4, 7, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {3, 2}, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -9805,6 +9889,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // SET_ROWS with turbo2 destination: quantize then dequant round-trip
+    for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (int64_t ne0 : {128, 256, 512}) {
+            for (int r : {1, 4, 7}) {
+                test_cases.emplace_back(new test_set_rows_turbo2(idx_type, ne0, 16, r));
+            }
+        }
+    }
+    // Large tensors -- exercises 2D dispatch grid, matching actual inference
+    // dimensions (4 kv_heads, batch=1024+)
+    test_cases.emplace_back(new test_set_rows_turbo2(GGML_TYPE_I32, 128, 4096, 1024));
+    test_cases.emplace_back(new test_set_rows_turbo2(GGML_TYPE_I32, 256, 2048, 512));
+    test_cases.emplace_back(new test_set_rows_turbo2(GGML_TYPE_I32, 512, 1024, 256));
+
     // SET_ROWS with turbo3 destination: quantize then dequant round-trip
     // Small tensors (single-dim dispatch)
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
@@ -9875,8 +9973,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
-                                                        if ((type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0) && hsk < 128) continue;
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+                                                        if ((type_KV == GGML_TYPE_TURBO2_0 || type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0) && hsk < 128) continue;
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));

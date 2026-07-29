@@ -243,7 +243,8 @@ void quantize(uint dst_idx, uint src_idx)
     }
 }
 #endif
-#if defined(DATA_A_TURBO3_0)
+
+#if defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO4_0)
 const float TS1[128] = float[128](
     -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
      1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
@@ -268,6 +269,9 @@ const float TS2[128] = float[128](
 
 const float TINV = 0.08838834764831845;  // 1 / sqrt(128)
 
+// TurboQuant 2-bit centroids
+const float T2M[3] = float[3](-0.086728, 0.0, 0.086728);
+
 const float TC[8] = float[8](
     -0.190685, -0.117832, -0.065717, -0.021460,
      0.021460,  0.065717,  0.117832,  0.190685
@@ -279,32 +283,22 @@ const float TM[7] = float[7](
      0.043589,  0.091775,  0.154259
 );
 
+// TurboQuant 4-bit midpoints
+const float T4M[15] = float[15](
+    -0.212203, -0.162947, -0.127026, -0.097164,
+    -0.070671, -0.046174, -0.022824,  0.000000,
+     0.022824,  0.046174,  0.070671,  0.097164,
+     0.127026,  0.162947,  0.212203
+);
+
 #if defined(SET_ROWS)
 
 shared float wht[128];
 shared float sg_acc[16];
 shared float gnrm;
 
-void quantize_block(uint b, uint o) {
-    [[unroll]] for (int j = 0; j < 32; ++j) data_q[b].qs[j]    = uint8_t(0);
-    [[unroll]] for (int j = 0; j < 16; ++j) data_q[b].signs[j] = uint8_t(0);
-    float rs = 0.0;
-    [[unroll]] for (int j = 0; j < 128; ++j) {
-        float v  = wht[o + j];
-        uint  i  = v < TM[0] ? 0 : v < TM[1] ? 1 : v < TM[2] ? 2 : v < TM[3] ? 3 :
-                   v < TM[4] ? 4 : v < TM[5] ? 5 : v < TM[6] ? 6 : 7;
-        rs += TC[i] * TC[i];
-        uint low2 = i & 0x3;
-        uint hi1  = (i >> 2) & 0x1;
-        data_q[b].qs[j / 4]    |= uint8_t(low2 << ((j % 4) * 2));
-        data_q[b].signs[j / 8] |= uint8_t(hi1  << (j % 8));
-    }
-    float rn = sqrt(rs);
-    data_q[b].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
-}
-
 #endif // defined(SET_ROWS)
-#endif // defined(DATA_A_TURBO3_0)
+#endif // defined(DATA_A_TURBO3_0) ...
 
 #if defined(DATA_A_TQ4_1S)
 
@@ -408,7 +402,7 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
-#if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
+#if defined(SET_ROWS) && (defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO4_0))
 void main() {
     const uint t   = gl_LocalInvocationID.x;
     const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -427,12 +421,10 @@ void main() {
     const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
     const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
 
-    // Step 1: load into shared memory
-    wht[t] = data_s[sb + t];
-    barrier();
+    float val = data_s[sb + t];
 
     // Step 2: L2 norm via subgroup reduction
-    float v2 = wht[t] * wht[t];
+    float v2 = val * val;
     v2 = subgroupAdd(v2);
     if (gl_SubgroupInvocationID == 0) sg_acc[gl_SubgroupID] = v2;
     barrier();
@@ -443,31 +435,51 @@ void main() {
     }
     barrier();
 
-    // Step 3: normalize, then apply forward WHT: signs1 -> butterfly -> signs2
-    wht[t] *= (gnrm > 1e-10) ? (1.0 / gnrm) : 0.0;
-    barrier();
+    // Step 3: normalize, then apply forward WHT
+    val *= (gnrm > 1e-10) ? (1.0 / gnrm) : 0.0;
+    val *= TS1[t];
 
-    wht[t] *= TS1[t];
-    barrier();
+    // Optimized WHT using subgroup shuffle
+    uint sg_size = gl_SubgroupSize;
+    for (uint h = 1; h < sg_size && h < 128; h *= 2) {
+        float other = subgroupShuffleXor(val, h);
+        val = ((t & h) == 0) ? (val + other) : (other - val);
+    }
 
-    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
-        if ((t % (2 * h)) < h) {
-            float a    = wht[t];
-            float b    = wht[t + h];
-            wht[t]     = a + b;
-            wht[t + h] = a - b;
-        }
+    if (sg_size < 128) {
+        wht[t] = val;
         barrier();
+        for (uint h = sg_size; h < 128; h *= 2) {
+            if ((t % (2 * h)) < h) {
+                float a = wht[t];
+                float b = wht[t + h];
+                wht[t]     = a + b;
+                wht[t + h] = a - b;
+            }
+            barrier();
+        }
+        val = wht[t];
     }
 
     // Step 5: apply signs2 + scaling
-    float rv = wht[t] * TINV * TS2[t];
+    val *= TINV * TS2[t];
 
-    // Step 6: quantize -- all 128 threads participate
-    uint idx = rv < TM[0] ? 0u : rv < TM[1] ? 1u : rv < TM[2] ? 2u : rv < TM[3] ? 3u :
-              rv < TM[4] ? 4u : rv < TM[5] ? 5u : rv < TM[6] ? 6u : 7u;
-
-    // Pack qs: 4 elements per byte via subgroup shuffle
+    // Step 6: Quantize
+#if defined(DATA_A_TURBO2_0)
+    uint idx = val < T2M[0] ? 0u : val < T2M[1] ? 1u : val < T2M[2] ? 2u : 3u;
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint my_2bit = idx & 0x3u;
+    uint qs_byte = 0u;
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        uint contrib = subgroupShuffle(my_2bit, (sg_lane & ~3u) + k);
+        qs_byte |= contrib << (k * 2u);
+    }
+    if (sg_lane % 4u == 0u) {
+        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
+    }
+#elif defined(DATA_A_TURBO3_0)
+    uint idx = val < TM[0] ? 0u : val < TM[1] ? 1u : val < TM[2] ? 2u : val < TM[3] ? 3u :
+              val < TM[4] ? 4u : val < TM[5] ? 5u : val < TM[6] ? 6u : 7u;
     uint sg_lane = gl_SubgroupInvocationID;
     uint my_low2 = idx & 0x3u;
     uint qs_byte = 0u;
@@ -478,18 +490,42 @@ void main() {
     if (sg_lane % 4u == 0u) {
         data_q[db].qs[t / 4u] = uint8_t(qs_byte);
     }
-
-    // Pack signs: 8 elements per byte via subgroup ballot
     uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
     if (sg_lane % 8u == 0u) {
         uint local_byte = sg_lane / 8u;
         data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
     }
+#elif defined(DATA_A_TURBO4_0)
+    uint idx = 0u;
+    if (val < T4M[7]) {
+        if (val < T4M[3]) {
+            if (val < T4M[1]) idx = (val < T4M[0]) ? 0u : 1u;
+            else idx = (val < T4M[2]) ? 2u : 3u;
+        } else {
+            if (val < T4M[5]) idx = (val < T4M[4]) ? 4u : 5u;
+            else idx = (val < T4M[6]) ? 6u : 7u;
+        }
+    } else {
+        if (val < T4M[11]) {
+            if (val < T4M[9]) idx = (val < T4M[8]) ? 8u : 9u;
+            else idx = (val < T4M[10]) ? 10u : 11u;
+        } else {
+            if (val < T4M[13]) idx = (val < T4M[12]) ? 12u : 13u;
+            else idx = (val < T4M[14]) ? 14u : 15u;
+        }
+    }
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint partner_idx = subgroupShuffle(idx, sg_lane ^ 1u);
+    uint byte_val = ((sg_lane & 1u) == 0u) ? (idx | (partner_idx << 4u)) : (partner_idx | (idx << 4u));
+    if ((sg_lane & 1u) == 0u) {
+        data_q[db].qs[t / 2u] = uint8_t(byte_val);
+    }
+#endif
 
-    // Step 7: reconstruction norm via subgroup reduction
+#if defined(DATA_A_TURBO3_0)
     float rc = TC[idx] * TC[idx];
     rc = subgroupAdd(rc);
-    if (sg_lane == 0u) sg_acc[gl_SubgroupID] = rc;
+    if (gl_SubgroupInvocationID == 0) sg_acc[gl_SubgroupID] = rc;
     barrier();
     if (t == 0u) {
         float total = 0.0;
@@ -497,243 +533,12 @@ void main() {
         float rn = sqrt(total);
         data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
     }
-}
-
-#elif defined(SET_ROWS) && defined(DATA_A_TURBO2_0)
-
-// Mirror of the TURBO3_0 block above, adapted for turbo2 (4 centroids,
-// 2-bit pack, no signs byte). WHT tables and reduction structure are
-// identical (QK = 128 for both).
-const float TS1_T2[128] = float[128](
-    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
-     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
-    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
-     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
-    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
-     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
-    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
-     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
-);
-const float TS2_T2[128] = float[128](
-     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
-     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
-     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
-     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
-     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
-    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
-     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
-    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
-);
-const float TINV_T2 = 0.08838834764831845;  // 1 / sqrt(128)
-// Lloyd-Max centroids for N(0, 1/128), 4 levels (matches CENTROIDS_2BIT in C ref)
-const float TC2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
-// Midpoints between adjacent centroids
-const float TM2[3] = float[3](-0.086728, 0.0, 0.086728);
-
-shared float wht_t2[128];
-shared float sg_acc_t2[16];
-shared float gnrm_t2;
-
-void main() {
-    const uint t   = gl_LocalInvocationID.x;
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint gpr = p.ne00 / 128;
-
-    if (gpr == 0) return;
-    if (g >= p.ne / 128) return;
-
-    uint tmp = g;
-    const uint ig  = tmp % gpr; tmp /= gpr;
-    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
-    const uint i02 = tmp % p.ne12;
-    const uint i03 = tmp / p.ne12;
-
-    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
-    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
-    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
-
-    wht_t2[t] = data_s[sb + t];
-    barrier();
-
-    float v2 = wht_t2[t] * wht_t2[t];
-    v2 = subgroupAdd(v2);
-    if (gl_SubgroupInvocationID == 0) sg_acc_t2[gl_SubgroupID] = v2;
-    barrier();
-    if (t == 0) {
-        float total = 0.0;
-        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t2[w];
-        gnrm_t2 = sqrt(total);
-    }
-    barrier();
-
-    wht_t2[t] *= (gnrm_t2 > 1e-10) ? (1.0 / gnrm_t2) : 0.0;
-    barrier();
-
-    wht_t2[t] *= TS1_T2[t];
-    barrier();
-
-    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
-        if ((t % (2 * h)) < h) {
-            float a    = wht_t2[t];
-            float b    = wht_t2[t + h];
-            wht_t2[t]     = a + b;
-            wht_t2[t + h] = a - b;
-        }
-        barrier();
-    }
-
-    float rv = wht_t2[t] * TINV_T2 * TS2_T2[t];
-
-    // Quantize to nearest of 4 centroids (2-bit index, no signs byte)
-    uint idx = rv < TM2[0] ? 0u : rv < TM2[1] ? 1u : rv < TM2[2] ? 2u : 3u;
-
-    // Pack qs: 4 elements per byte (full 2-bit each, no high bit)
-    uint sg_lane = gl_SubgroupInvocationID;
-    uint qs_byte = 0u;
-    [[unroll]] for (uint k = 0; k < 4; k++) {
-        uint contrib = subgroupShuffle(idx & 0x3u, (sg_lane & ~3u) + k);
-        qs_byte |= contrib << (k * 2u);
-    }
-    if (sg_lane % 4u == 0u) {
-        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
-    }
-
-    // Reconstruction norm via subgroup reduction
-    float rc = TC2[idx] * TC2[idx];
-    rc = subgroupAdd(rc);
-    if (sg_lane == 0u) sg_acc_t2[gl_SubgroupID] = rc;
-    barrier();
+#else
     if (t == 0u) {
-        float total = 0.0;
-        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t2[w];
-        float rn = sqrt(total);
-        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_t2 / rn) : gnrm_t2);
+        data_q[db].norm = float16_t(gnrm);
     }
+#endif
 }
-
-#elif defined(SET_ROWS) && defined(DATA_A_TURBO4_0)
-
-// Mirror of the TURBO3_0 block above, adapted for turbo4 (16 centroids,
-// 4-bit nibble pack, no signs byte). WHT tables and reduction structure
-// are identical (QK = 128 for both).
-const float TS1_T4[128] = float[128](
-    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
-     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
-    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
-     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
-    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
-     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
-    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
-     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
-);
-const float TS2_T4[128] = float[128](
-     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
-     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
-     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
-     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
-     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
-    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
-     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
-    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
-);
-const float TINV_T4 = 0.08838834764831845;  // 1 / sqrt(128)
-// Lloyd-Max centroids for N(0, 1/128), 16 levels (matches CENTROIDS_4BIT in C ref)
-const float TC4[16] = float[16](
-    -0.241529, -0.182877, -0.143016, -0.111036,
-    -0.083292, -0.058050, -0.034299, -0.011349,
-     0.011349,  0.034299,  0.058050,  0.083292,
-     0.111036,  0.143016,  0.182877,  0.241529
-);
-// 15 midpoints between adjacent centroids (matches nearest_centroid_4bit in C ref)
-const float TM4[15] = float[15](
-    -0.212203, -0.162947, -0.127026, -0.097164,
-    -0.070671, -0.046174, -0.022824,  0.0,
-     0.022824,  0.046174,  0.070671,  0.097164,
-     0.127026,  0.162947,  0.212203
-);
-
-shared float wht_t4[128];
-shared float sg_acc_t4[16];
-shared float gnrm_t4;
-
-void main() {
-    const uint t   = gl_LocalInvocationID.x;
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint gpr = p.ne00 / 128;
-
-    if (gpr == 0) return;
-    if (g >= p.ne / 128) return;
-
-    uint tmp = g;
-    const uint ig  = tmp % gpr; tmp /= gpr;
-    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
-    const uint i02 = tmp % p.ne12;
-    const uint i03 = tmp / p.ne12;
-
-    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
-    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
-    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
-
-    wht_t4[t] = data_s[sb + t];
-    barrier();
-
-    float v2 = wht_t4[t] * wht_t4[t];
-    v2 = subgroupAdd(v2);
-    if (gl_SubgroupInvocationID == 0) sg_acc_t4[gl_SubgroupID] = v2;
-    barrier();
-    if (t == 0) {
-        float total = 0.0;
-        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t4[w];
-        gnrm_t4 = sqrt(total);
-    }
-    barrier();
-
-    wht_t4[t] *= (gnrm_t4 > 1e-10) ? (1.0 / gnrm_t4) : 0.0;
-    barrier();
-
-    wht_t4[t] *= TS1_T4[t];
-    barrier();
-
-    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
-        if ((t % (2 * h)) < h) {
-            float a    = wht_t4[t];
-            float b    = wht_t4[t + h];
-            wht_t4[t]     = a + b;
-            wht_t4[t + h] = a - b;
-        }
-        barrier();
-    }
-
-    float rv = wht_t4[t] * TINV_T4 * TS2_T4[t];
-
-    // Quantize to nearest of 16 centroids (4-bit index, no signs byte)
-    uint idx = 0u;
-    [[unroll]] for (uint i = 0; i < 15; i++) {
-        if (rv >= TM4[i]) idx = i + 1u;
-    }
-
-    // Pack qs: 2 elements per byte (4-bit nibble each)
-    uint sg_lane = gl_SubgroupInvocationID;
-    uint pair_low  = subgroupShuffle(idx & 0xFu, sg_lane & ~1u);
-    uint pair_high = subgroupShuffle(idx & 0xFu, (sg_lane & ~1u) + 1u);
-    uint qs_byte = pair_low | (pair_high << 4u);
-    if (sg_lane % 2u == 0u) {
-        data_q[db].qs[t / 2u] = uint8_t(qs_byte);
-    }
-
-    // Reconstruction norm via subgroup reduction
-    float rc = TC4[idx] * TC4[idx];
-    rc = subgroupAdd(rc);
-    if (sg_lane == 0u) sg_acc_t4[gl_SubgroupID] = rc;
-    barrier();
-    if (t == 0u) {
-        float total = 0.0;
-        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc_t4[w];
-        float rn = sqrt(total);
-        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm_t4 / rn) : gnrm_t4);
-    }
-}
-
 #elif defined(SET_ROWS) && defined(DATA_A_TQ4_1S)
 
 void main() {

@@ -1347,32 +1347,105 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 }
 #endif
 
-#if defined(DATA_A_TURBO3_0)
+#if defined(DATA_A_TQ4_1S)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ4_1S {
+   block_tq4_1s block;
+};
+float16_t dequantFuncTQ4_1S(const in decodeBufTQ4_1S bl, const in uint blockCoords[2], const in uint coordInBlock[2]) { return float16_t(0); }
+#endif
+
+// Note: turbo dequant functions are defined unconditionally (not gated behind
+// DATA_A_TURBO*_0) because, like the legacy Q1_0/Q2_0/Q4_0/.../Q8_0 decoders
+// above, they are also invoked from the single generic flash-attention shader
+// (flash_attn_cm2.comp), which is compiled once for all K/V types and
+// dispatches via a runtime FaTypeK/FaTypeV switch rather than per-type
+// DATA_A_* compile-time defines.
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO2_0 {
+   block_turbo2_0 block;
+};
+float16_t dequantFuncTURBO2_0(const in decodeBufTURBO2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+    const uint idx = (uint(bl.block.qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
+    return float16_t(centroids[idx] * norm);
+}
+
+f16vec4 dequantFuncTURBO2_0_v(const in decodeBufTURBO2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    const float norm = float(bl.block.norm);
+    const uint idx = coordInBlock[1];
+    const uint bits = uint(bl.block.qs[idx >> 2]);
+    return f16vec4(
+        centroids[bits & 0x3u] * norm,
+        centroids[(bits >> 2) & 0x3u] * norm,
+        centroids[(bits >> 4) & 0x3u] * norm,
+        centroids[(bits >> 6) & 0x3u] * norm);
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO3_0 {
    block_turbo3_0 block;
 };
-
 float16_t dequantFuncTURBO3_0(const in decodeBufTURBO3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
-    const float centroids[8] = float[8](
-        -0.190685, -0.117832, -0.065717, -0.021460,
-         0.021460,  0.065717,  0.117832,  0.190685
-    );
+    const float centroids[8] = float[8](-0.190685, -0.117832, -0.065717, -0.021460, 0.021460, 0.065717, 0.117832, 0.190685);
     const float norm = float(bl.block.norm);
     const uint j = coordInBlock[1];
-
-    // Extract 2-bit low index from qs (4 per byte)
     const uint low2 = (uint(bl.block.qs[j / 4]) >> ((j % 4) * 2)) & 0x3;
-
-    // Extract 1-bit high from signs (8 per byte)
     const uint hi1 = (uint(bl.block.signs[j / 8]) >> (j % 8)) & 0x1;
+    return float16_t(centroids[low2 | (hi1 << 2)] * norm);
+}
 
-    // Combine to 3-bit index
-    const uint idx = low2 | (hi1 << 2);
+f16vec4 dequantFuncTURBO3_0_v(const in decodeBufTURBO3_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[8] = float[8](-0.190685, -0.117832, -0.065717, -0.021460, 0.021460, 0.065717, 0.117832, 0.190685);
+    const float norm = float(bl.block.norm);
+    const uint idx = coordInBlock[1];
+    const uint qbyte = uint(bl.block.qs[idx >> 2]);
+    const uint sbyte = uint(bl.block.signs[idx >> 3]);
+    const uint sshift = idx & 0x7u; // 0 or 4, bit offset of element `idx` within sbyte
+    const uint low0 = qbyte & 0x3u;
+    const uint low1 = (qbyte >> 2) & 0x3u;
+    const uint low2 = (qbyte >> 4) & 0x3u;
+    const uint low3 = (qbyte >> 6) & 0x3u;
+    const uint hi0 = (sbyte >> sshift) & 0x1u;
+    const uint hi1 = (sbyte >> (sshift + 1u)) & 0x1u;
+    const uint hi2 = (sbyte >> (sshift + 2u)) & 0x1u;
+    const uint hi3 = (sbyte >> (sshift + 3u)) & 0x1u;
+    return f16vec4(
+        centroids[low0 | (hi0 << 2)] * norm,
+        centroids[low1 | (hi1 << 2)] * norm,
+        centroids[low2 | (hi2 << 2)] * norm,
+        centroids[low3 | (hi3 << 2)] * norm);
+}
 
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTURBO4_0 {
+   block_turbo4_0 block;
+};
+float16_t dequantFuncTURBO4_0(const in decodeBufTURBO4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[16] = float[16](-0.241529, -0.182877, -0.143016, -0.111036, -0.083292, -0.058050, -0.034299, -0.011349, 0.011349, 0.034299, 0.058050, 0.083292, 0.111036, 0.143016, 0.182877, 0.241529);
+    const float norm = float(bl.block.norm);
+    const uint j = coordInBlock[1];
+    const uint idx = (uint(bl.block.qs[j / 2]) >> ((j % 2) * 4)) & 0xF;
     return float16_t(centroids[idx] * norm);
 }
-#endif
+
+f16vec4 dequantFuncTURBO4_0_v(const in decodeBufTURBO4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const float centroids[16] = float[16](-0.241529, -0.182877, -0.143016, -0.111036, -0.083292, -0.058050, -0.034299, -0.011349, 0.011349, 0.034299, 0.058050, 0.083292, 0.111036, 0.143016, 0.182877, 0.241529);
+    const float norm = float(bl.block.norm);
+    const uint idx = coordInBlock[1];
+    const uint b0 = uint(bl.block.qs[idx >> 1]);
+    const uint b1 = uint(bl.block.qs[(idx >> 1) + 1u]);
+    return f16vec4(
+        centroids[b0 & 0xFu] * norm,
+        centroids[(b0 >> 4) & 0xFu] * norm,
+        centroids[b1 & 0xFu] * norm,
+        centroids[(b1 >> 4) & 0xFu] * norm);
+}
 
 #if defined(DATA_A_Q1_0)
 #define dequantFuncA dequantFuncQ1_0
@@ -1447,8 +1520,17 @@ float16_t dequantFuncTURBO3_0(const in decodeBufTURBO3_0 bl, const in uint block
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
 #define dequantFuncA_v dequantFuncNVFP4_v
+#elif defined(DATA_A_TQ4_1S)
+#define dequantFuncA dequantFuncTQ4_1S
+#elif defined(DATA_A_TURBO2_0)
+#define dequantFuncA dequantFuncTURBO2_0
+#define dequantFuncA_v dequantFuncTURBO2_0_v
 #elif defined(DATA_A_TURBO3_0)
 #define dequantFuncA dequantFuncTURBO3_0
+#define dequantFuncA_v dequantFuncTURBO3_0_v
+#elif defined(DATA_A_TURBO4_0)
+#define dequantFuncA dequantFuncTURBO4_0
+#define dequantFuncA_v dequantFuncTURBO4_0_v
 #elif defined(DATA_A_F32)
 #define dequantFuncA dequantFuncF32
 #endif
