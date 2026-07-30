@@ -50,6 +50,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -1000,6 +1001,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_turbo_wht;
+    // TriAttention scoring, one variant per supported K cache type (see triattention_vk_k_type_id)
+    vk_pipeline pipeline_triattention_score[6];
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
@@ -5629,6 +5632,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
     ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+
+    // TriAttention scoring: one pipeline per K cache type, FREQ_COUNT/K_TYPE_ID/NEED_WHT_INV are spec constants
+    for (uint32_t kt = 0; kt < 6; ++kt) {
+        const uint32_t need_wht_inv = (kt == 3 /* TURBO2_0 */ || kt == 4 /* TURBO3_0 */) ? 1u : 0u;
+        ggml_vk_create_pipeline(device, device->pipeline_triattention_score[kt], "triattention_score",
+                                 triattention_score_len, triattention_score_data, "main", 11,
+                                 sizeof(uint32_t) * 8, {64, 1, 1}, {64, kt, need_wht_inv}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -17386,6 +17397,241 @@ static ggml_backend_i ggml_backend_vk_interface = {
 static ggml_guid_t ggml_backend_vk_guid() {
     static ggml_guid guid = { 0xb8, 0xf7, 0x4f, 0x86, 0x40, 0x3c, 0xe1, 0x02, 0x91, 0xc8, 0xdd, 0xe9, 0x02, 0x3f, 0xc0, 0x2b };
     return &guid;
+}
+
+// ---- TriAttention GPU scoring (Vulkan) ----
+
+struct triattention_vk_state {
+    ggml_backend_vk_context * ctx;
+    triattention_vk_config cfg;
+    vk_buffer d_omega;
+    vk_buffer d_freq_scale_sq;
+    vk_buffer d_offsets;
+    vk_buffer d_q_mean_real;
+    vk_buffer d_q_mean_imag;
+    vk_buffer d_q_mean_abs;
+    vk_buffer d_extra_weight;
+
+    // Batch scratch buffers, grown on demand and reused across prune() calls
+    // instead of being created/destroyed for every sampled head.
+    vk_buffer d_cells;
+    vk_buffer d_pos;
+    vk_buffer d_scores;
+    uint32_t  cells_capacity  = 0;  // in elements
+    uint32_t  scores_capacity = 0;  // in elements
+
+    // Open batch state, live between batch_begin() and batch_end()
+    vk_context batch_subctx;
+    uint32_t   batch_n_cells = 0;
+};
+
+static uint32_t triattention_vk_k_type_id(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:      return 0;
+        case GGML_TYPE_F16:      return 1;
+        case GGML_TYPE_Q8_0:     return 2;
+        case GGML_TYPE_TURBO2_0: return 3;
+        case GGML_TYPE_TURBO3_0: return 4;
+        case GGML_TYPE_TURBO4_0: return 5;
+        default:
+            GGML_ABORT("triattention_vk: unsupported K cache type");
+    }
+}
+
+triattention_vk_state * triattention_vk_init(
+        ggml_backend_t backend,
+        const struct triattention_vk_config * config,
+        const struct triattention_vk_head_calib * head_calibs,
+        const float * omega,
+        const float * freq_scale_sq,
+        const float * offsets) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+
+    triattention_vk_state * state = new triattention_vk_state();
+    state->ctx = ctx;
+    state->cfg = *config;
+
+    const size_t fc_bytes = sizeof(float) * config->freq_count;
+    const size_t calib_bytes = sizeof(float) * config->freq_count * config->n_sampled;
+
+    state->d_omega         = ggml_vk_create_buffer_check(ctx->device, fc_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_freq_scale_sq = ggml_vk_create_buffer_check(ctx->device, fc_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_offsets       = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * config->n_offsets, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_q_mean_real   = ggml_vk_create_buffer_check(ctx->device, calib_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_q_mean_imag   = ggml_vk_create_buffer_check(ctx->device, calib_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_q_mean_abs    = ggml_vk_create_buffer_check(ctx->device, calib_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+    state->d_extra_weight  = ggml_vk_create_buffer_check(ctx->device, calib_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+
+    ggml_vk_buffer_write(state->d_omega, 0, omega, fc_bytes);
+    ggml_vk_buffer_write(state->d_freq_scale_sq, 0, freq_scale_sq, fc_bytes);
+    ggml_vk_buffer_write(state->d_offsets, 0, offsets, sizeof(float) * config->n_offsets);
+
+    // Calibration arrays are per-head; pack them contiguously so score_head can bind
+    // a sub-range [head_calib_idx * freq_count, ...] via a byte offset.
+    std::vector<float> real_packed(config->freq_count * config->n_sampled);
+    std::vector<float> imag_packed(config->freq_count * config->n_sampled);
+    std::vector<float> abs_packed(config->freq_count * config->n_sampled);
+    std::vector<float> ew_packed(config->freq_count * config->n_sampled);
+    for (uint32_t h = 0; h < config->n_sampled; h++) {
+        std::memcpy(real_packed.data() + h * config->freq_count, head_calibs[h].q_mean_real, fc_bytes);
+        std::memcpy(imag_packed.data() + h * config->freq_count, head_calibs[h].q_mean_imag, fc_bytes);
+        std::memcpy(abs_packed.data()  + h * config->freq_count, head_calibs[h].q_mean_abs,  fc_bytes);
+        std::memcpy(ew_packed.data()   + h * config->freq_count, head_calibs[h].extra_weight, fc_bytes);
+    }
+    ggml_vk_buffer_write(state->d_q_mean_real, 0, real_packed.data(), calib_bytes);
+    ggml_vk_buffer_write(state->d_q_mean_imag, 0, imag_packed.data(), calib_bytes);
+    ggml_vk_buffer_write(state->d_q_mean_abs, 0, abs_packed.data(), calib_bytes);
+    ggml_vk_buffer_write(state->d_extra_weight, 0, ew_packed.data(), calib_bytes);
+
+    return state;
+}
+
+// Grows `buf` in-place (destroy + recreate) if its current capacity is
+// smaller than `needed_bytes`; no-op otherwise. Lets batch scratch buffers
+// be reused across prune() calls instead of churned per sampled head.
+static void triattention_vk_ensure_capacity(ggml_backend_vk_context * ctx, vk_buffer & buf, size_t needed_bytes) {
+    if (buf && buf->size >= needed_bytes) {
+        return;
+    }
+    if (buf) {
+        ggml_vk_destroy_buffer(buf);
+    }
+    buf = ggml_vk_create_buffer_check(ctx->device, needed_bytes, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+}
+
+// Uploads the (shared, per-prune-call) candidate cell indices/positions once
+// and opens a single command buffer that subsequent batch_enqueue_head()
+// calls record dispatches into — mirrors the CUDA path's single upload
+// followed by N asynchronously-enqueued kernel launches.
+void triattention_vk_batch_begin(
+        triattention_vk_state * state,
+        const uint32_t * cell_indices_host,
+        const int32_t  * positions_host,
+        uint32_t n_cells,
+        uint32_t n_total_scores) {
+    ggml_backend_vk_context * ctx = state->ctx;
+
+    triattention_vk_ensure_capacity(ctx, state->d_cells,  sizeof(uint32_t) * n_cells);
+    triattention_vk_ensure_capacity(ctx, state->d_pos,    sizeof(int32_t)  * n_cells);
+    triattention_vk_ensure_capacity(ctx, state->d_scores, sizeof(float)    * n_total_scores);
+    state->cells_capacity  = std::max(state->cells_capacity, n_cells);
+    state->scores_capacity = std::max(state->scores_capacity, n_total_scores);
+
+    ggml_vk_buffer_write(state->d_cells, 0, cell_indices_host, sizeof(uint32_t) * n_cells);
+    ggml_vk_buffer_write(state->d_pos, 0, positions_host, sizeof(int32_t) * n_cells);
+
+    state->batch_n_cells = n_cells;
+    state->batch_subctx  = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    ggml_vk_ctx_begin(ctx->device, state->batch_subctx);
+}
+
+// Records one head's dispatch into the currently open batch (no submit).
+void triattention_vk_batch_enqueue_head(
+        triattention_vk_state * state,
+        const struct ggml_tensor * k_tensor,
+        uint32_t kv_head_idx,
+        uint32_t head_calib_idx,
+        int64_t round_start,
+        int agg_mode,
+        uint32_t score_offset_elems) {
+    const uint32_t n_cells = state->batch_n_cells;
+    if (n_cells == 0) {
+        return;
+    }
+
+    ggml_backend_vk_context * ctx = state->ctx;
+    const triattention_vk_config & cfg = state->cfg;
+    const uint32_t k_type_id = triattention_vk_k_type_id(cfg.k_type);
+    vk_pipeline & pipeline = ctx->device->pipeline_triattention_score[k_type_id];
+
+    const size_t row_bytes = ggml_row_size(cfg.k_type, cfg.head_dim);
+    const size_t head_offset_bytes = row_bytes * kv_head_idx;
+    const size_t calib_offset_bytes = sizeof(float) * cfg.freq_count * head_calib_idx;
+    const size_t score_offset_bytes = sizeof(float) * score_offset_elems;
+
+    struct {
+        uint32_t row_bytes;
+        uint32_t head_offset_bytes;
+        uint32_t padded_hd;
+        uint32_t n_cells;
+        int32_t  round_start;
+        uint32_t n_offsets;
+        uint32_t agg_mode;
+        uint32_t disable_trig;
+    } pc = {
+        (uint32_t) row_bytes,
+        (uint32_t) head_offset_bytes,
+        cfg.head_dim,
+        n_cells,
+        (int32_t) round_start,
+        cfg.n_offsets,
+        (uint32_t) agg_mode,
+        cfg.disable_trig ? 1u : 0u,
+    };
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_allocate_descriptor_sets(ctx);
+
+    ggml_vk_dispatch_pipeline(ctx, state->batch_subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, k_tensor),
+        ggml_vk_subbuffer(ctx, state->d_cells),
+        ggml_vk_subbuffer(ctx, state->d_pos),
+        ggml_vk_subbuffer(ctx, state->d_omega),
+        ggml_vk_subbuffer(ctx, state->d_freq_scale_sq),
+        ggml_vk_subbuffer(ctx, state->d_offsets),
+        ggml_vk_subbuffer(ctx, state->d_q_mean_real, calib_offset_bytes),
+        ggml_vk_subbuffer(ctx, state->d_q_mean_imag, calib_offset_bytes),
+        ggml_vk_subbuffer(ctx, state->d_q_mean_abs, calib_offset_bytes),
+        ggml_vk_subbuffer(ctx, state->d_extra_weight, calib_offset_bytes),
+        ggml_vk_subbuffer(ctx, state->d_scores, score_offset_bytes),
+    }, pc, { n_cells * cfg.freq_count, 1, 1 });
+}
+
+// Submits the whole batch, waits on a single fence, and reads all scores
+// back to host in one copy.
+void triattention_vk_batch_end(
+        triattention_vk_state * state,
+        float * scores_host_out,
+        uint32_t n_total_scores) {
+    if (state->batch_n_cells == 0) {
+        return;
+    }
+
+    ggml_backend_vk_context * ctx = state->ctx;
+
+    ggml_vk_ctx_end(state->batch_subctx);
+    ggml_vk_submit(state->batch_subctx, ctx->fence);
+    VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "triattention_vk_batch_end waitForFences");
+    ctx->device->device.resetFences({ ctx->fence });
+    ggml_vk_queue_command_pools_cleanup(ctx->device);
+
+    ggml_vk_buffer_read(state->d_scores, 0, scores_host_out, sizeof(float) * n_total_scores);
+
+    // This backend is a dedicated instance, never driven through the normal
+    // graph-compute path, so nothing else resets the descriptor-set index /
+    // requirement counters between calls. Reset them here now that the batch
+    // has fully drained, so the descriptor pool stays bounded to roughly one
+    // batch's worth of sets instead of growing every prune() call forever.
+    ctx->pipeline_descriptor_set_requirements = 0;
+    ctx->descriptor_set_idx = 0;
+
+    state->batch_subctx  = nullptr;
+    state->batch_n_cells = 0;
+}
+
+void triattention_vk_free(triattention_vk_state * state) {
+    if (state == nullptr) {
+        return;
+    }
+    ggml_vk_destroy_buffer(state->d_omega);
+    ggml_vk_destroy_buffer(state->d_freq_scale_sq);
+    ggml_vk_destroy_buffer(state->d_offsets);
+    ggml_vk_destroy_buffer(state->d_q_mean_real);
+    ggml_vk_destroy_buffer(state->d_q_mean_imag);
+    ggml_vk_destroy_buffer(state->d_q_mean_abs);
+    ggml_vk_destroy_buffer(state->d_extra_weight);
+    delete state;
 }
 
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {

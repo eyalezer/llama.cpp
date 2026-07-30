@@ -20,6 +20,9 @@
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"   // GPU scoring: triattention_gpu_init, _score_head, etc.
 #endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h" // GPU scoring (Vulkan): triattention_vk_init, _score_head, etc.
+#endif
 
 // Block types and dequant declarations are in ggml-common.h (ggml/src/)
 // which is not on the include path for src/. We declare the dequant
@@ -745,6 +748,18 @@ void triattention_free(triattention_state * state) {
     }
 #endif
 
+#ifdef GGML_USE_VULKAN
+    // Free Vulkan scoring resources if initialized (mutually exclusive with CUDA above)
+    if (state->d_vk_state) {
+        triattention_vk_free((triattention_vk_state *)state->d_vk_state);
+        state->d_vk_state = nullptr;
+    }
+    if (state->vk_backend) {
+        ggml_backend_free((ggml_backend_t)state->vk_backend);
+        state->vk_backend = nullptr;
+    }
+#endif
+
     delete state;
 }
 
@@ -936,6 +951,68 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
             (int)k_type, cal->n_sampled);
 }
 #endif // GGML_USE_CUDA
+
+#ifdef GGML_USE_VULKAN
+// Initializes Vulkan GPU scoring state, mutually exclusive with the CUDA path
+// above (only attempted if CUDA init did not already succeed). `kt` is a
+// representative K tensor used only to confirm its buffer lives on a Vulkan
+// device before allocating a Vulkan backend instance.
+static void triattention_init_vk(triattention_state * state, ggml_type k_type, const ggml_tensor * kt) {
+    if (state->vk_init_tried) return;
+    state->vk_init_tried = true;
+
+    if (kt == nullptr || kt->buffer == nullptr) {
+        return;
+    }
+    const char * buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(kt->buffer));
+    if (strstr(buft_name, "Vulkan") == nullptr) {
+        return; // K cache is not on a Vulkan device, nothing to do here
+    }
+
+    ggml_backend_t backend = ggml_backend_vk_init(0);
+    if (!backend) {
+        fprintf(stderr, "[TriAttention] Vulkan backend init failed, using CPU scoring\n");
+        return;
+    }
+
+    const triattention_calibration * cal = state->cal;
+    const triattention_config & cfg = state->cfg;
+
+    triattention_vk_config vcfg = {};
+    vcfg.head_dim     = cal->head_dim;
+    vcfg.freq_count   = cal->freq_count;
+    vcfg.n_kv_heads   = cal->num_kv_heads;
+    vcfg.n_sampled    = cal->n_sampled;
+    vcfg.n_offsets    = state->n_offsets;
+    vcfg.k_type       = k_type;
+    vcfg.need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
+    vcfg.disable_trig = cfg.disable_trig;
+
+    std::vector<triattention_vk_head_calib> vcalibs(cal->n_sampled);
+    for (uint32_t h = 0; h < cal->n_sampled; h++) {
+        vcalibs[h].q_mean_real  = cal->head_stats[h].q_mean_real;
+        vcalibs[h].q_mean_imag  = cal->head_stats[h].q_mean_imag;
+        vcalibs[h].q_mean_abs   = cal->head_stats[h].q_mean_abs;
+        vcalibs[h].extra_weight = cal->head_stats[h].extra_weight;
+    }
+
+    auto * vk_st = triattention_vk_init(
+        backend, &vcfg, vcalibs.data(),
+        state->omega, state->freq_scale_sq, state->offsets);
+    if (!vk_st) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "[TriAttention] Vulkan GPU init failed, using CPU scoring\n");
+        return;
+    }
+
+    state->vk_backend  = backend;
+    state->d_vk_state  = vk_st;
+    state->use_vk      = true;
+
+    fprintf(stderr, "[TriAttention] Vulkan scoring enabled (k_type=%d, heads=%u)\n",
+            (int)k_type, cal->n_sampled);
+}
+#endif // GGML_USE_VULKAN
 
 int32_t triattention_prune(
     triattention_state * state,
@@ -1171,6 +1248,14 @@ int32_t triattention_prune_impl(
     }
 #endif
 
+#ifdef GGML_USE_VULKAN
+    // Only attempted if CUDA scoring did not already take over this state.
+    if (!state->use_gpu && !state->vk_init_tried) {
+        const ggml_tensor * kt0 = (n_layers > 0) ? k_tensors[0] : nullptr;
+        triattention_init_vk(state, k_type, kt0);
+    }
+#endif
+
 #ifdef GGML_USE_CUDA
     if (state->use_gpu) {
         // ---- GPU path ----
@@ -1244,9 +1329,47 @@ int32_t triattention_prune_impl(
         triattention_gpu_free_dev(d_cell_indices);
         triattention_gpu_free_dev(d_positions);
 
-    } else
+    }
 #endif // GGML_USE_CUDA
-    {
+
+#ifdef GGML_USE_VULKAN
+    if (state->use_vk) {
+        // ---- Vulkan GPU path (batched: upload once, enqueue N, sync once) ----
+        // Mirrors the CUDA path above instead of doing one submit+fence-wait
+        // per sampled head.
+        auto * vk_state = (triattention_vk_state *)state->d_vk_state;
+        triattention_vk_batch_begin(
+            vk_state, decode_cell_idx.data(), decode_positions.data(),
+            n_decode, (uint32_t)((size_t)cal->n_sampled * n_decode));
+
+        for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
+            const uint32_t layer_idx = cal->sampled_layer[sh];
+            const uint32_t attn_head = cal->sampled_head[sh];
+            const uint32_t kv_head   = attn_head / cal->num_kv_groups;
+
+            int32_t ikv = -1;
+            for (uint32_t l = 0; l < n_layers; l++) {
+                if (layer_map[l] == (int32_t)layer_idx) { ikv = (int32_t)l; break; }
+            }
+            if (ikv < 0) {
+                memset(score_buf + (size_t)sh * n_decode, 0, n_decode * sizeof(float));
+                continue;
+            }
+
+            const ggml_tensor * kt = k_tensors[ikv];
+            triattention_vk_batch_enqueue_head(
+                vk_state, kt, kv_head, sh,                    // head_calib_idx
+                (int64_t)state->absolute_position,            // round_start
+                (int)cfg.agg,
+                (uint32_t)((size_t)sh * n_decode));           // output offset
+        }
+
+        triattention_vk_batch_end(
+            vk_state, score_buf, (uint32_t)((size_t)cal->n_sampled * n_decode));
+    }
+
+#endif // GGML_USE_VULKAN
+    if(!state->use_gpu && !state->use_vk) {
         // ---- CPU fallback path ----
         for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
             const uint32_t layer_idx = cal->sampled_layer[sh];

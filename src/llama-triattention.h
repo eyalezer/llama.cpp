@@ -180,6 +180,12 @@ struct triattention_state {
     bool     use_gpu;              // true once GPU state is successfully initialized
     bool     gpu_init_tried;       // prevents re-trying init on failure
 
+    // Vulkan scoring state (lazily initialized on first prune, mutually exclusive with CUDA)
+    void *   d_vk_state;            // triattention_vk_state* — device calibration data
+    void *   vk_backend;            // ggml_backend_t owned by this state, for one-off dispatch
+    bool     use_vk;                // true once Vulkan state is successfully initialized
+    bool     vk_init_tried;         // prevents re-trying init on failure
+
     // Monitoring statistics
     uint64_t total_prune_calls;
     uint64_t total_tokens_evicted;
