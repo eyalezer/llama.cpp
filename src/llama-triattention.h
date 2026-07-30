@@ -186,6 +186,12 @@ struct triattention_state {
     bool     use_vk;                // true once Vulkan state is successfully initialized
     bool     vk_init_tried;         // prevents re-trying init on failure
 
+    // Metal scoring state (lazily initialized on first prune, mutually exclusive with CUDA/Vulkan)
+    void *   d_mtl_state;           // triattention_mtl_state* — device calibration data
+    void *   mtl_backend;           // ggml_backend_t owned by this state, for one-off dispatch
+    bool     use_mtl;               // true once Metal state is successfully initialized
+    bool     mtl_init_tried;        // prevents re-trying init on failure
+
     // Monitoring statistics
     uint64_t total_prune_calls;
     uint64_t total_tokens_evicted;

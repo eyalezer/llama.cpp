@@ -131,6 +131,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv     
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht         (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_triattention_score (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_tq_rotated(ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -325,6 +326,17 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+
+// buffer_id for buffer index 0 at offset 0 — for ad-hoc buffers not backed by
+// any ggml_tensor (e.g. standalone dispatch code such as TriAttention scoring).
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_raw(ggml_metal_buffer_t buf);
+
+//
+// standalone command buffer dispatch (outside ggml_metal_graph_compute)
+//
+
+ggml_metal_cmd_buf_t ggml_metal_device_new_command_buffer(ggml_metal_device_t dev);
+void ggml_metal_cmd_buf_commit_and_wait(ggml_metal_cmd_buf_t cmd_buf);
 
 #ifdef __cplusplus
 }

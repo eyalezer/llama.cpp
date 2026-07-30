@@ -2032,3 +2032,20 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     return res;
 }
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_raw(ggml_metal_buffer_t buf) {
+    return (struct ggml_metal_buffer_id) { buf->buffers[0].metal, 0 };
+}
+
+ggml_metal_cmd_buf_t ggml_metal_device_new_command_buffer(ggml_metal_device_t dev) {
+    id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBufferWithUnretainedReferences];
+    [cmd_buf retain];
+    return (ggml_metal_cmd_buf_t) cmd_buf;
+}
+
+void ggml_metal_cmd_buf_commit_and_wait(ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+    [cmd_buf release];
+}

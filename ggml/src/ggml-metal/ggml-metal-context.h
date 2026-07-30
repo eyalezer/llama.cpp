@@ -17,6 +17,11 @@ void ggml_metal_free(ggml_metal_t ctx);
 
 const char * ggml_metal_get_name(ggml_metal_t ctx);
 
+// backend->context is opaque outside this file; used by standalone dispatch
+// code (e.g. TriAttention scoring) that needs the device without going
+// through the graph-compute path.
+ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx);
+
 void ggml_metal_synchronize(ggml_metal_t ctx);
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
