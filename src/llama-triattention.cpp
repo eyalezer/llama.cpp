@@ -17,7 +17,9 @@
 #include "llama-hparams.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"   // GPU scoring: triattention_gpu_init, _score_head, etc.
+#endif
 
 // Block types and dequant declarations are in ggml-common.h (ggml/src/)
 // which is not on the include path for src/. We declare the dequant
@@ -732,6 +734,7 @@ void triattention_free(triattention_state * state) {
     delete[] state->keep_indices;
 
     // Free GPU scoring resources if initialized
+#ifdef GGML_USE_CUDA
     if (state->d_scores) {
         triattention_gpu_free_dev(state->d_scores);
         state->d_scores = nullptr;
@@ -740,6 +743,7 @@ void triattention_free(triattention_state * state) {
         triattention_gpu_free((triattention_gpu_state *)state->d_gpu_state);
         state->d_gpu_state = nullptr;
     }
+#endif
 
     delete state;
 }
@@ -882,6 +886,7 @@ static void top_k_indices(
 // of the actual cache to select the right kernel variant.
 // k_type must be a type supported by the GPU kernel (Q4_K, Q8_0, F16, F32,
 // TURBO2_0, TURBO3_0, TURBO4_0). On failure, falls back silently to CPU.
+#ifdef GGML_USE_CUDA
 static void triattention_init_gpu(triattention_state * state, ggml_type k_type) {
     if (state->gpu_init_tried) return;
     state->gpu_init_tried = true;
@@ -930,6 +935,7 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     fprintf(stderr, "[TriAttention] GPU scoring enabled (k_type=%d, heads=%u)\n",
             (int)k_type, cal->n_sampled);
 }
+#endif // GGML_USE_CUDA
 
 int32_t triattention_prune(
     triattention_state * state,
@@ -1159,10 +1165,13 @@ int32_t triattention_prune_impl(
     const ggml_type k_type = (n_layers > 0 && k_tensors[0]) ? k_tensors[0]->type : GGML_TYPE_F32;
 
     // Lazy GPU init: runs only once per state lifetime
+#ifdef GGML_USE_CUDA
     if (!state->gpu_init_tried) {
         triattention_init_gpu(state, k_type);
     }
+#endif
 
+#ifdef GGML_USE_CUDA
     if (state->use_gpu) {
         // ---- GPU path ----
         // Upload the n_decode candidate cell indices + positions to device.
@@ -1235,7 +1244,9 @@ int32_t triattention_prune_impl(
         triattention_gpu_free_dev(d_cell_indices);
         triattention_gpu_free_dev(d_positions);
 
-    } else {
+    } else
+#endif // GGML_USE_CUDA
+    {
         // ---- CPU fallback path ----
         for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
             const uint32_t layer_idx = cal->sampled_layer[sh];
