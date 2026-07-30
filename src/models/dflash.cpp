@@ -440,7 +440,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
-
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
     }

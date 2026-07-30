@@ -1075,6 +1075,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
                         LOG("[%5d] %s", port, buffer);
                     }
                 }
+                // EOF on stdout — child process exited (could be a crash).
+                // Immediately mark UNLOADED so /v1/models stops advertising
+                // this model as loaded.
+                if (feof(stdout_file)) {
+                    this->update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
+                }
             } else {
                 SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
             }
@@ -1125,7 +1131,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
         child_proc->stopped.store(true, std::memory_order_release);
         {
-            std::lock_guard<std::mutex> lk(this->mutex);
+            std::lock_guard<std::mutex> lk(this->stop_mutex);
             stopping_models.erase(name);
             cv_stop.notify_all();
         }
@@ -1182,13 +1188,16 @@ void server_models::unload(const std::string & name) {
             });
         } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
-            stopping_models.insert(name);
+            {
+                std::lock_guard<std::mutex> lk2(stop_mutex);
+                stopping_models.insert(name);
+                cv_stop.notify_all();
+            }
             if (it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
                 // special case: if model is in loading state, unloading means force-killing it
                 SRV_WRN("model name=%s is still loading, force-killing\n", name.c_str());
                 it->second.subproc->terminate();
             }
-            cv_stop.notify_all();
             // status change will be handled by the managing thread
         } else {
             SRV_WRN("model instance name=%s is not running\n", name.c_str());
@@ -1200,6 +1209,7 @@ void server_models::unload_all() {
     std::vector<std::thread> to_join;
     {
         std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<std::mutex> lk2(stop_mutex);
         for (auto & [name, inst] : mapping) {
             if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
                 SRV_INF("cancelling download for model name=%s\n", name.c_str());
@@ -1989,6 +1999,12 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+                if (meta.is_signaled()) {
+                    status["exit_signal"] = meta.exit_signal();
+                }
+            }
+            if (!meta.last_error.empty()) {
+                status["last_error"] = meta.last_error;
             }
 
             // pi coding agent multimodal compatibility
