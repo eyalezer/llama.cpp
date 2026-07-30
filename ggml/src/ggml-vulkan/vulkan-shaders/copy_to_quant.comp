@@ -300,16 +300,32 @@ shared float gnrm;
 #endif // defined(SET_ROWS)
 #endif // defined(DATA_A_TURBO3_0) ...
 
-#if defined(DATA_A_TQ4_1S)
+#if defined(DATA_A_TQ3_1S) || defined(DATA_A_TQ4_1S)
 
-const float TQ4_SIGNS[32] = float[32](
+const float TQ_SIGNS[32] = float[32](
     +1, -1, +1, -1, +1, +1, -1, +1,
     -1, -1, +1, -1, +1, +1, -1, +1,
     -1, -1, +1, -1, +1, -1, -1, +1,
     -1, +1, +1, -1, +1, -1, -1, +1
 );
 
-const float TQ4_INV_SQRT32 = 0.17677669529663688;  // 1 / sqrt(32)
+const float TQ_INV_SQRT32 = 0.17677669529663688;  // 1 / sqrt(32)
+
+const float TQ3_CENTROIDS[8] = float[8](
+    -1.996684, -1.291398, -0.740341, -0.247508,
+     0.230106,  0.725222,  1.277503,  1.988943
+);
+
+uint tq3_choose_index(float val) {
+    if (val < -1.644041) return 0u;
+    if (val < -1.015869) return 1u;
+    if (val < -0.493925) return 2u;
+    if (val < -0.008701) return 3u;
+    if (val <  0.477664) return 4u;
+    if (val <  1.001362) return 5u;
+    if (val <  1.633223) return 6u;
+    return 7u;
+}
 
 const float TQ4_CENTROIDS[16] = float[16](
     -2.732590, -2.069017, -1.618046, -1.256231,
@@ -338,7 +354,7 @@ uint tq4_choose_index(float val) {
     return 15u;
 }
 
-#endif // defined(DATA_A_TQ4_1S)
+#endif // defined(DATA_A_TQ4_1S) ...
 
 #if defined(DATA_A_IQ4_NL)
 uint best_index(float x) {
@@ -539,7 +555,7 @@ void main() {
     }
 #endif
 }
-#elif defined(SET_ROWS) && defined(DATA_A_TQ4_1S)
+#elif defined(SET_ROWS) && (defined(DATA_A_TQ4_1S) || defined(DATA_A_TQ3_1S))
 
 void main() {
     const uint t   = gl_LocalInvocationID.x;    // 0..31, one per block element
@@ -564,16 +580,16 @@ void main() {
 
     // Step 2: Forward RHT via subgroup ops
     // Sign flip
-    val *= TQ4_SIGNS[t];
+    val *= TQ_SIGNS[t];
 
     // WHT butterfly via subgroupShuffleXor
-    [[unroll]] for (uint h = 1u; h < 32u; h <<= 1u) {
+    for (uint h = 1u; h < 32u; h <<= 1u) {
         const float other = subgroupShuffleXor(val, h);
         val = ((t & h) == 0u) ? (val + other) : (other - val);
     }
 
     // Normalize
-    val *= TQ4_INV_SQRT32;
+    val *= TQ_INV_SQRT32;
 
     // Step 3: Dual half-block RMS scale computation
     float sq = val * val;
@@ -582,7 +598,7 @@ void main() {
     float rms_lo = sqrt(sum_sq_lo / 16.0);
     float rms_hi = sqrt(sum_sq_hi / 16.0);
 
-    // Step 4: Scale search (9 points) — matches CPU quantize_row_tq4_1s_ref
+    // Step 4: Scale search (9 points)
     const float SCALES[9] = float[9](0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.35, 1.5);
     float best_d0 = rms_lo;
     float best_d1 = rms_hi;
@@ -595,8 +611,13 @@ void main() {
             ? ((d0 > 1e-10) ? 1.0 / d0 : 0.0)
             : ((d1 > 1e-10) ? 1.0 / d1 : 0.0);
 
+#if defined(DATA_A_TQ3_1S)
+        uint idx = tq3_choose_index(val * inv);
+        float c = TQ3_CENTROIDS[idx];
+#else
         uint idx = tq4_choose_index(val * inv);
         float c = TQ4_CENTROIDS[idx];
+#endif
         float d = (t < 16u) ? d0 : d1;
         float diff2 = val - c * d;
         float local_err = diff2 * diff2;
@@ -610,13 +631,18 @@ void main() {
     }
 
     // Step 5: Iterative refinement (6 iterations)
-    [[unroll]] for (uint iter = 0u; iter < 6u; iter++) {
+    for (uint iter = 0u; iter < 6u; iter++) {
         float inv = (t < 16u)
             ? ((best_d0 > 1e-10) ? 1.0 / best_d0 : 0.0)
             : ((best_d1 > 1e-10) ? 1.0 / best_d1 : 0.0);
 
+#if defined(DATA_A_TQ3_1S)
+        uint idx = tq3_choose_index(val * inv);
+        float c = TQ3_CENTROIDS[idx];
+#else
         uint idx = tq4_choose_index(val * inv);
         float c = TQ4_CENTROIDS[idx];
+#endif
 
         float num_lo = subgroupAdd((t < 16u) ? val * c : 0.0);
         float den_lo = subgroupAdd((t < 16u) ? c * c   : 0.0);
@@ -631,22 +657,82 @@ void main() {
     float inv_final = (t < 16u)
         ? ((best_d0 > 1e-10) ? 1.0 / best_d0 : 0.0)
         : ((best_d1 > 1e-10) ? 1.0 / best_d1 : 0.0);
+#if defined(DATA_A_TQ3_1S)
+    uint cidx = tq3_choose_index(val * inv_final);
+#else
     uint cidx = tq4_choose_index(val * inv_final);
+#endif
 
-    // Step 7: Nibble packing — two 4-bit indices per byte
-    // Even element j: low nibble; odd element j: high nibble
-    // Thread t pairs with thread t^1
+    // Step 7: Packing
+#if defined(DATA_A_TQ4_1S)
     uint partner_idx = subgroupShuffle(cidx, t ^ 1u);
-    uint byte_val;
-    if ((t & 1u) == 0u) {
-        byte_val = cidx | (partner_idx << 4u);
-    } else {
-        byte_val = partner_idx | (cidx << 4u);
-    }
-    // Only even threads write (one byte per pair)
+    uint byte_val = ((t & 1u) == 0u) ? (cidx | (partner_idx << 4u)) : (partner_idx | (cidx << 4u));
     if ((t & 1u) == 0u) {
         data_q[db].qs[t >> 1u] = uint8_t(byte_val);
     }
+#else
+    // TQ3_1S packing: 8 values -> 3 bytes
+    // Thread 0-7: byte 0, 1, 2
+    uint v0 = subgroupShuffle(cidx, 0);
+    uint v1 = subgroupShuffle(cidx, 1);
+    uint v2 = subgroupShuffle(cidx, 2);
+    uint v3 = subgroupShuffle(cidx, 3);
+    uint v4 = subgroupShuffle(cidx, 4);
+    uint v5 = subgroupShuffle(cidx, 5);
+    uint v6 = subgroupShuffle(cidx, 6);
+    uint v7 = subgroupShuffle(cidx, 7);
+
+    if (t == 0) {
+        data_q[db].qs[0] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[1] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[2] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 8);
+    v1 = subgroupShuffle(cidx, 9);
+    v2 = subgroupShuffle(cidx, 10);
+    v3 = subgroupShuffle(cidx, 11);
+    v4 = subgroupShuffle(cidx, 12);
+    v5 = subgroupShuffle(cidx, 13);
+    v6 = subgroupShuffle(cidx, 14);
+    v7 = subgroupShuffle(cidx, 15);
+
+    if (t == 0) {
+        data_q[db].qs[3] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[4] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[5] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 16);
+    v1 = subgroupShuffle(cidx, 17);
+    v2 = subgroupShuffle(cidx, 18);
+    v3 = subgroupShuffle(cidx, 19);
+    v4 = subgroupShuffle(cidx, 20);
+    v5 = subgroupShuffle(cidx, 21);
+    v6 = subgroupShuffle(cidx, 22);
+    v7 = subgroupShuffle(cidx, 23);
+
+    if (t == 0) {
+        data_q[db].qs[6] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[7] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[8] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 24);
+    v1 = subgroupShuffle(cidx, 25);
+    v2 = subgroupShuffle(cidx, 26);
+    v3 = subgroupShuffle(cidx, 27);
+    v4 = subgroupShuffle(cidx, 28);
+    v5 = subgroupShuffle(cidx, 29);
+    v6 = subgroupShuffle(cidx, 30);
+    v7 = subgroupShuffle(cidx, 31);
+
+    if (t == 0) {
+        data_q[db].qs[9]  = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[10] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[11] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+#endif
 
     // Step 8: Store scales (thread 0 writes both)
     if (t == 0u) {

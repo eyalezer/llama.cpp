@@ -1888,6 +1888,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // TQ
+    if (is_tq_weight && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
+        // Handles ne[1]=1 (decode) and ne[1]<=8 (multi-token / speculative decoding)
+        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+        return;
+    }
+    if (is_tq_weight) {
+        // Large prefill: runtime TQ weight -> fp16 conversion + cuBLAS
+        // Gets tensor core throughput without permanent 1.7x VRAM cost
+        ggml_cuda_mul_mat_tq_cublas(ctx, src0, src1, dst);
+        return;
+    }
+    // TQ
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -1918,18 +1932,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-        return;
-    }
-    if (is_tq_weight && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
-        // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
-        // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
-        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
-        return;
-    }
-    if (is_tq_weight && src0->type == GGML_TYPE_TQ4_1S) {
-        // Large prefill: runtime TQ4_1S → q8_0 scratch conversion + cuBLAS
-        // Gets tensor core throughput without permanent 1.7× VRAM cost
-        ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);

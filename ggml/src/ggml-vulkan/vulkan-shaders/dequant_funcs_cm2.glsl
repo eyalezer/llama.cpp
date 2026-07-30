@@ -1385,6 +1385,13 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 }
 #endif
 
+#if defined(DATA_A_TQ3_1S)
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ3_1S {
+   block_tq3_1s block;
+};
+float16_t dequantFuncTQ3_1S(const in decodeBufTQ3_1S bl, const in uint blockCoords[2], const in uint coordInBlock[2]) { return float16_t(0); }
+#endif
+
 #if defined(DATA_A_TQ4_1S)
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ4_1S {
    block_tq4_1s block;
@@ -1561,6 +1568,8 @@ f16vec4 dequantFuncTURBO4_0_v(const in decodeBufTURBO4_0 bl, const in uint block
 #elif defined(DATA_A_NVFP4)
 #define dequantFuncA dequantFuncNVFP4
 #define dequantFuncA_v dequantFuncNVFP4_v
+#elif defined(DATA_A_TQ3_1S)
+#define dequantFuncA dequantFuncTQ3_1S
 #elif defined(DATA_A_TQ4_1S)
 #define dequantFuncA dequantFuncTQ4_1S
 #elif defined(DATA_A_TURBO2_0)

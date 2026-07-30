@@ -740,6 +740,38 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TQ3_1S)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float centroids[8] = float[8](
+        -1.996684, -1.291398, -0.740341, -0.247508,
+         0.230106,  0.725222,  1.277503,  1.988943
+    );
+    const uint group = iqs / 8u;
+    const uint i8 = iqs % 8u;
+    const uint b0 = uint(data_a[a_offset + ib].qs[group * 3 + 0]);
+    const uint b1 = uint(data_a[a_offset + ib].qs[group * 3 + 1]);
+    const uint b2 = uint(data_a[a_offset + ib].qs[group * 3 + 2]);
+    uint idx0, idx1;
+    switch(i8) {
+        case 0: idx0 = b0 & 7u; idx1 = (b0 >> 3u) & 7u; break;
+        case 2: idx0 = ((b0 >> 6u) | (b1 << 2u)) & 7u; idx1 = (b1 >> 1u) & 7u; break;
+        case 4: idx0 = (b1 >> 4u) & 7u; idx1 = ((b1 >> 7u) | (b2 << 1u)) & 7u; break;
+        case 6: idx0 = (b2 >> 2u) & 7u; idx1 = (b2 >> 5u) & 7u; break;
+    }
+    const float d0 = (iqs < 16) ? float(data_a[a_offset + ib].d0) : float(data_a[a_offset + ib].d1);
+    const float d1 = ((iqs+1) < 16) ? float(data_a[a_offset + ib].d0) : float(data_a[a_offset + ib].d1);
+    return vec2(centroids[idx0] * d0, centroids[idx1] * d1);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1, 0);
+}
+#endif
+
 #if defined(DATA_A_TQ4_1S)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const float centroids[16] = float[16](
