@@ -401,6 +401,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },
     { LLM_KV_TOKENIZER_MIDDLE_ID, "tokenizer.ggml.middle_token_id" },
+
+    { LLM_KV_EAGLE3_EXTRACT_LAYERS,      "%s.extract_layers"        },
+    { LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE,  "%s.target_hidden_size"    },
+    { LLM_KV_EAGLE3_NORM_BEFORE_RESIDUAL,"%s.norm_before_residual"  },
+
+    { LLM_KV_DFLASH_TARGET_LAYER_IDS,    "%s.target_layers"         },
+    { LLM_KV_DFLASH_BLOCK_SIZE,          "%s.block_size"            },
+    { LLM_KV_DFLASH_MASK_TOKEN_ID,       "%s.mask_token_id"         },
+
 };
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {

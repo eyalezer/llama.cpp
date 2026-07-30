@@ -1,4 +1,4 @@
-# llama.cpp
+# llama.cpp + TurboQuant+
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -16,6 +16,97 @@
 [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 </div>
+
+A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) integrating the [TurboQuant+](https://github.com/TheTom/llama-cpp-turboquant) implementation of TheTom's TurboQuant+ codec. This fork adds KV-cache and weight quantization types, cross-backend kernel support, and model-family-specific fixes.
+
+## What this fork adds
+
+### KV-cache quantization (runtime, `--cache-type-k` / `--cache-type-v`)
+
+| Type | Bits | Use case |
+|---|---|---|
+| `turbo4` | ~4.5 | Lightest compression; safe starting point |
+| `turbo3` | ~3.5 | Recommended: ~4.6× V compression at <1.5% PPL loss |
+| `turbo2` | ~2.0 | Aggressive; pair with Boundary V protection |
+
+**Key insight**: [Asymmetric K/V compression](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/asymmetric-kv-compression.md) — **V tolerates aggressive compression, K does not**. Always keep K at higher precision (`f16` or `q8_0`) and compress V.
+
+Recommended configs:
+- **Safe start**: `--cache-type-k f16 --cache-type-v turbo4`
+- **Default**: `--cache-type-k q8_0 --cache-type-v turbo3`
+- **Long context**: `--cache-type-k q8_0 --cache-type-v turbo2`
+
+### Weight quantization (offline, via `llama-quantize`)
+
+| Type | Bits | Notes |
+|---|---|---|
+| `TQ4_1S` | ~4.5 | Recommended: V2.1 fused Metal kernels, CUDA `dp4a` 3.5× faster |
+| `TQ3_1S` | ~3.5 | Smaller VRAM than `q8_0`; accept ~1-2 PPL bump |
+
+```bash
+llama-quantize model.f16.gguf model.tq4_1s.gguf TQ4_1S
+```
+
+### Advanced features
+
+- **Auto-asymmetric K/V** — complementary codec selection when both sides are turbo/TQ types
+- **Boundary V (layer-aware)** — auto-enabled for `turbo2-V`; protects sensitive layers
+- **Sparse V dequantization** — Metal-only; skips dequant for low-attention positions
+- **Flash Attention** — auto-enabled with backend-specific kernels
+
+### Backend coverage
+
+| Backend | Kernels | Flash Attn | Notes |
+|---|---|---|---|
+| **Metal** (Apple Silicon) | V2.1 fused, TurboFlash | Yes (`dk=512` for Gemma 4) | Sparse V across family |
+| **CUDA** (NVIDIA) | `dp4a` for TQ4_1S, warp-cooperative dequant | Yes (turbo VEC FA +9%) | Multi-GPU support |
+| **HIP/ROCm** (AMD) | Portable `ggml_cuda_dp4a`, scalar half fallback | Yes (VEC FA forced) | RDNA3/4, CDNA3/4 |
+| **Vulkan** | `TQ4_1S` weights, `SET_ROWS` for turbo K/V | coopmat flash attn | Compute-shader path |
+| **SYCL** (Intel) | `SET_ROWS`, WHT rotation | VEC FA for all combos | Intel Arc A380/B70 |
+
+### Model-family support
+
+- **Gemma 4** — MoE token routing, op-concurrency handling
+- **Large MoE** — up to 256-expert routing kernels
+- **Hybrid architectures** (Mamba/GDN) — speculative decoding integration
+- All existing llama.cpp models remain fully supported
+
+---
+
+## Quick start
+
+### Build from source
+
+```bash
+# Clone this fork (not upstream!)
+git clone https://github.com/eyalezer/llama.cpp.git
+
+cd llama.cpp
+
+# Build with your preferred backend
+cmake -B build -DGGML_METAL=ON && cmake --build build -j
+# or: cmake -B build -DGGML_CUDA=ON && cmake --build build -j
+# or: cmake -B build -DGGML_VULKAN=ON && cmake --build build -j
+
+# Run a model with turbo KV cache
+llama-cli -m model.gguf --cache-type-k q8_0 --cache-type-v turbo3 -p "Hello!"
+```
+
+---
+
+## Why the `+`?
+
+TurboQuant+ extends Google's original TurboQuant (ICLR 2026) paper with:
+
+- Asymmetric K/V policy ([paper](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/asymmetric-kv-compression.md))
+- Layer-aware Boundary V protection ([paper](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/layer-aware-v-compression.md))
+- Attention-gated sparse V dequantization ([paper](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/sparse-v-dequant.md))
+- `TQ3_1S` / `TQ4_1S` weight quantization ([paper](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/weight-compression-tq4.md))
+- Cross-backend kernel coverage (CUDA `dp4a`, HIP RDNA/CDNA, Vulkan coopmat, Metal V2.1)
+
+The trailing `+` denotes ongoing extension work; the original TurboQuant codec remains the foundation.
+
+---
 
 ## Quick start
 
