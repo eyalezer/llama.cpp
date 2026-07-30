@@ -320,7 +320,7 @@ static __global__ void mul_mat_tq4_1s_scalar_multi(
 
 // ============================================================================
 // Dispatch: ne[1]=1 (decode), ne[1]≤8 (multi-token dp4a / scalar)
-// ne[1]>8 handled by ggml_cuda_mul_mat_tq4_1s_cublas (runtime dequant + cuBLAS)
+// ne[1]>8 handled by ggml_cuda_mul_mat_tq_cublas (runtime dequant + cuBLAS)
 // AMD: uses scalar half path for TQ4_1S (dp4a regresses on RDNA4)
 // ============================================================================
 
@@ -511,15 +511,15 @@ void ggml_cuda_convert_tq4_1s_to_q8_0(const void * src_tq4, void * dst_q8, int64
 }
 
 // ============================================================================
-// Large prefill: runtime TQ4_1S → q8_0 scratch + q8_0→fp16 dequant + cuBLAS
+// Large prefill: runtime TQ3_1S/TQ4_1S → fp16 dequant + cuBLAS
 // Gets tensor core throughput without permanent 1.7× VRAM cost.
 // ============================================================================
 
-void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
-                                      const ggml_tensor * src0,
-                                      const ggml_tensor * src1,
-                                      ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S);
+void ggml_cuda_mul_mat_tq_cublas(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor * src0,
+                                  const ggml_tensor * src1,
+                                  ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -534,10 +534,10 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
 
     const int64_t n_elements = ne00 * ne01;
 
-    // Step 1: TQ4_1S → fp16 via warp-cooperative dequant (WHT in-warp)
+    // Step 1: TQ weight → fp16 via warp-cooperative dequant (WHT in-warp)
     ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(id), n_elements);
     {
-        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_TQ4_1S);
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(src0->type);
         GGML_ASSERT(to_fp16 != nullptr);
         to_fp16((const char *)src0->data, src0_f16.get(), n_elements, stream);
     }

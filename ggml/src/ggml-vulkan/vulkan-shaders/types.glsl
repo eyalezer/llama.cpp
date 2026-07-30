@@ -1827,6 +1827,23 @@ struct block_turbo4_0
 #endif
 
 
+#define QUANT_K_TQ3_1S 32
+#define QUANT_R_TQ3_1S 1
+
+struct block_tq3_1s
+{
+    float16_t d0;
+    float16_t d1;
+    uint8_t qs[12];     // 3-bit indices packed (32 * 3 / 8 = 12 bytes)
+};
+
+#if defined(DATA_A_TQ3_1S)
+#define QUANT_K QUANT_K_TQ3_1S
+#define QUANT_R QUANT_R_TQ3_1S
+#define QUANT_AUXF 1
+#define A_TYPE block_tq3_1s
+#endif
+
 #define QUANT_K_TQ4_1S 32
 #define QUANT_R_TQ4_1S 1
 

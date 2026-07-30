@@ -10,8 +10,8 @@ inline void ggml_cuda_mul_mat_vec_tq(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
 }
 
-// Large prefill: runtime TQ4_1S → q8_0 scratch + cuBLAS
-void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// Large prefill: runtime TQ3_1S/TQ4_1S → fp16 + cuBLAS tensor-core GEMM
+void ggml_cuda_mul_mat_tq_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 // Load-time conversion: TQ4_1S → q8_0 in VRAM (dequant + requantize)
 void ggml_cuda_convert_tq4_1s_to_q8_0(const void * src_tq4, void * dst_q8, int64_t n_elements, cudaStream_t stream);
