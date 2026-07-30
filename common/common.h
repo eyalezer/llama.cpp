@@ -346,6 +346,11 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    bool    eagle3       = false; // use EAGLE3 speculative decoding
+    bool    dflash       = false; // use DFlash speculative decoding
+    int32_t n_ctx        = 0;  // draft context size
+
 };
 
 struct common_params_speculative_ngram_mod {
@@ -681,7 +686,9 @@ struct common_params {
     std::string slot_save_path;
     std::string media_path; // path to directory for loading media files
 
-    float slot_prompt_similarity = 0.1f;
+    float   slot_prompt_similarity        = 0.1f;
+    float   slot_cache_key_similarity     = 0.5f;
+    int32_t slot_cache_key_min_prefix     = 32;
 
     // batched-bench params
     bool is_pp_shared   = false;
