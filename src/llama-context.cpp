@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3968,6 +3971,34 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+static llama_kv_cache * resolve_kv_cache_for_triattention(llama_memory_t mem) {
+    if (!mem) {
+        return nullptr;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv;
+    }
+
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) {
+        return hybrid->get_mem_attn();
+    }
+
+    auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hybrid_iswa) {
+        return hybrid_iswa->get_mem_attn()->get_base();
+    }
+
+    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
+    if (kv_iswa) {
+        return kv_iswa->get_base();
+    }
+
+    return nullptr;
+}
+
 int32_t llama_triattention_init(
         struct llama_context * ctx,
                   const char * stats_path,
@@ -3994,7 +4025,7 @@ int32_t llama_triattention_init(
         return -1;
     }
 
-    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    auto * kv = resolve_kv_cache_for_triattention(mem);
     if (!kv) {
         LLAMA_LOG_ERROR("%s: memory is not a KV cache (recurrent models not supported)\n", __func__);
         return -1;
