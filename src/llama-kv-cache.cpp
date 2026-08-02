@@ -1104,7 +1104,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // trial pass: cells/heads written here are unconditionally rolled back below,
+        // so TriAttention side effects must be skipped to avoid permanent desync/eviction
+        apply_ubatch(sinfo_new, ubatch, /*is_trial=*/true);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1446,7 +1448,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_trial) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1486,12 +1488,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
-                triattention_on_cell_removed(triattention_st, idx);
+                if (!is_trial) {
+                    triattention_on_cell_removed(triattention_st, idx);
+                }
                 cells.rm(idx);
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
-            triattention_on_token_added(triattention_st, idx, ubatch.pos[i]);
+            if (!is_trial) {
+                triattention_on_token_added(triattention_st, idx, ubatch.pos[i]);
+            }
 
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
@@ -1536,7 +1542,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     // TriAttention: set prefix length and check if pruning should trigger
-    if (triattention_st != nullptr) {
+    // Skipped entirely during prepare()'s speculative trial pass (is_trial=true), since
+    // that pass's cell/head writes get unconditionally rolled back afterward, but these
+    // side effects (bookkeeping + real eviction via try_prune) are not part of that rollback.
+    if (triattention_st != nullptr && !is_trial) {
         // Extend prefix_length over every prefill ubatch (n_tokens > 1) so the whole
         // initial prompt is protected, not just its first n_ubatch-sized chunk; a
         // decode ubatch (n_tokens == 1) means prefill is over, so stop extending it.

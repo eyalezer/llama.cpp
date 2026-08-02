@@ -207,7 +207,10 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // is_trial: true when called from prepare()'s speculative pass, which unconditionally
+    // rolls back cells/heads afterward - TriAttention side effects must be skipped in that
+    // case, since they are not part of that rollback and would otherwise become permanent.
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_trial = false);
 
     //
     // input API
