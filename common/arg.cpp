@@ -4647,6 +4647,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_AGG").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--triattention-rope-style"}, "STYLE",
+        "RoPE layout used by pre-RoPE inversion: auto, half, interleaved (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto")             params.triattention_rope_style = -1;
+            else if (value == "half")        params.triattention_rope_style = 0;
+            else if (value == "interleaved") params.triattention_rope_style = 1;
+            else throw std::invalid_argument("invalid triattention rope style: " + value);
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_ROPE_STYLE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--triattention-seed"}, "N",
         string_format("RNG seed for tie-breaking noise, -1 to disable (default: %d)", params.triattention_seed),
         [](common_params & params, int value) {
@@ -4688,6 +4698,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.triattention_log = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-protect-roles"}, "ROLES",
+        string_format("comma list of chat roles (system,user,assistant,tool) whose message\n"
+                      "spans are never evicted by TriAttention, empty to disable (default: %s)",
+                      params.triattention_protect_roles.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.triattention_protect_roles = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_PROTECT_ROLES").set_examples({LLAMA_EXAMPLE_SERVER}));
 
     return ctx_arg;
 }

@@ -805,6 +805,7 @@ extern "C" {
     // trigger: 0=interval, 1=slack
     // agg: 0=mean, 1=max
     // seed: RNG seed for tie-breaking noise (-1 to disable)
+    // rope_style: -1=auto (derived from the model's own RoPE type), 0=half, 1=interleaved
     // Returns 0 on success, -1 on failure.
     LLAMA_API int32_t llama_triattention_init(
             struct llama_context * ctx,
@@ -820,7 +821,16 @@ extern "C" {
                             bool   protect_prefill,
                             bool   disable_mlr,
                             bool   disable_trig,
-                            bool   enable_logging);
+                            bool   enable_logging,
+                         int32_t   rope_style);
+
+    // Mark [pos_start, pos_end) as never-evict by TriAttention (e.g. tool-call
+    // results or system-prompt spans the caller wants to preserve verbatim).
+    // No-op if TriAttention is not initialized on this context's KV cache.
+    LLAMA_API void llama_triattention_protect_range(
+            struct llama_context * ctx,
+                         int64_t   pos_start,
+                         int64_t   pos_end);
 
     //
     // State / sessions

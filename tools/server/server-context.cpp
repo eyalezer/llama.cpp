@@ -23,6 +23,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <set>
 #include <utility>
 #include <fstream>
 
@@ -196,6 +197,10 @@ struct server_slot {
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
 
+    // whether message spans for the current task have been registered as
+    // TriAttention-protected ranges (done once per task, see triattention_protect_roles)
+    bool triattention_spans_protected = false;
+
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -294,6 +299,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        triattention_spans_protected = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3437,6 +3443,28 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+
+                    // register message spans (e.g. tool-call results, system prompt) as
+                    // TriAttention-protected ranges once per task, so eviction never drops
+                    // them even long after they scroll out of the recent window/prefix
+                    if (!slot.triattention_spans_protected) {
+                        slot.triattention_spans_protected = true;
+
+                        if (!params_base.triattention_protect_roles.empty()) {
+                            std::set<common_chat_role> protect_roles;
+                            for (const auto & name : string_split<std::string>(params_base.triattention_protect_roles, ',')) {
+                                protect_roles.insert(common_chat_role_from_string(name));
+                            }
+
+                            for (const auto & span : spans.spans) {
+                                if (protect_roles.count(span.role)) {
+                                    llama_triattention_protect_range(slot.ctx_tgt,
+                                            (int64_t) span.pos,
+                                            (int64_t) (span.pos + span.len));
+                                }
+                            }
+                        }
+                    }
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {

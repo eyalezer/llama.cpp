@@ -19,7 +19,8 @@ LLAMA_API bool llama_triattention_init(
     bool     protect_prefill,
     bool     disable_mlr,
     bool     disable_trig,
-    bool     enable_logging);
+    bool     enable_logging,
+    int32_t  rope_style);
 ```
 
 Initialize TriAttention KV cache eviction on a context. Must be called after
@@ -43,6 +44,7 @@ context creation and before inference begins.
 | `disable_mlr` | `bool` | Ablation: disable MLR weighting |
 | `disable_trig` | `bool` | Ablation: norm-only scoring |
 | `enable_logging` | `bool` | Log pruning events to stderr |
+| `rope_style` | `int32_t` | -1=auto (derived from model), 0=half, 1=interleaved |
 
 **Returns:** `true` if initialization succeeded, `false` on error (bad file,
 model mismatch, context doesn't use KV cache).
@@ -61,7 +63,8 @@ triattention_state * triattention_init(
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads);
+    uint32_t n_kv_heads,
+    uint32_t rope_style);
 
 // Free all resources
 void triattention_free(triattention_state * state);

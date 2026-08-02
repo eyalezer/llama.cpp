@@ -110,8 +110,9 @@ static void matvec_128(const float * mat, const float * vec, float * out) {
 // Binary calibration file I/O
 // ============================================================================
 
-// Load .triattention calibration file
-// Returns nullptr on any error, with diagnostic printed to stderr
+// Load .triattention calibration file (TRIA v1/v2 dense format, see
+// llama-triattention.h for the layout). Returns nullptr on any error, with
+// diagnostic printed to stderr.
 static triattention_calibration * triattention_load_calibration(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) {
@@ -119,7 +120,6 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         return nullptr;
     }
 
-    // Read and validate magic
     uint32_t magic;
     if (fread(&magic, sizeof(uint32_t), 1, f) != 1 || magic != TRIATTENTION_MAGIC) {
         fprintf(stderr, "[TriAttention] ERROR: invalid magic in %s (got 0x%08x, expected 0x%08x)\n",
@@ -128,11 +128,11 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         return nullptr;
     }
 
-    // Read and validate version
     uint32_t version;
-    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != TRIATTENTION_VERSION) {
-        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected %u)\n",
-                version, path, TRIATTENTION_VERSION);
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 ||
+        version < TRIATTENTION_VERSION_MIN || version > TRIATTENTION_VERSION_MAX) {
+        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected %u-%u)\n",
+                version, path, TRIATTENTION_VERSION_MIN, TRIATTENTION_VERSION_MAX);
         fclose(f);
         return nullptr;
     }
@@ -140,16 +140,18 @@ static triattention_calibration * triattention_load_calibration(const char * pat
     auto * cal = new triattention_calibration();
     memset(cal, 0, sizeof(triattention_calibration));
 
-    // Read header fields
+    uint32_t num_heads = 0;
+    float rope_theta_f32 = 0.0f;
+    float attn_scale = 0.0f;
+
     bool ok = true;
-    ok = ok && fread(&cal->head_dim,        sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_layers,      sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_attn_heads,  sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_kv_heads,    sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->rope_theta,      sizeof(double),   1, f) == 1;
-    ok = ok && fread(&cal->rope_style,      sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->n_sampled,       sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->freq_count,      sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->num_layers,   sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&num_heads,         sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->num_kv_heads, sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->head_dim,     sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->freq_count,   sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&rope_theta_f32,    sizeof(float),    1, f) == 1;
+    ok = ok && fread(&attn_scale,        sizeof(float),    1, f) == 1;
 
     if (!ok) {
         fprintf(stderr, "[TriAttention] ERROR: truncated header in %s\n", path);
@@ -157,24 +159,19 @@ static triattention_calibration * triattention_load_calibration(const char * pat
         fclose(f);
         return nullptr;
     }
+    (void) attn_scale; // not applied yet, see docs/TRIATTENTION.md
 
-    // Read model name
-    uint32_t name_len;
-    if (fread(&name_len, sizeof(uint32_t), 1, f) != 1 || name_len == 0 || name_len > 255) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid model name length %u in %s\n", name_len, path);
+    cal->num_attn_heads = num_heads;
+    cal->rope_theta     = (double) rope_theta_f32;
+
+    // Skip reserved bytes up to the fixed 64-byte header.
+    if (fseek(f, TRIATTENTION_HEADER_SIZE, SEEK_SET) != 0) {
+        fprintf(stderr, "[TriAttention] ERROR: cannot seek past header in %s\n", path);
         delete cal;
         fclose(f);
         return nullptr;
     }
-    if (fread(cal->model_name, 1, name_len, f) != name_len) {
-        fprintf(stderr, "[TriAttention] ERROR: truncated model name in %s\n", path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-    cal->model_name[name_len] = '\0';
 
-    // Validate basic field consistency
     if (cal->freq_count != cal->head_dim / 2) {
         fprintf(stderr, "[TriAttention] ERROR: freq_count (%u) != head_dim/2 (%u) in %s\n",
                 cal->freq_count, cal->head_dim / 2, path);
@@ -194,100 +191,104 @@ static triattention_calibration * triattention_load_calibration(const char * pat
 
     cal->num_kv_groups = cal->num_attn_heads / cal->num_kv_heads;
 
-    // Allocate per-head arrays
-    cal->sampled_layer = new uint32_t[cal->n_sampled];
-    cal->sampled_head  = new uint32_t[cal->n_sampled];
-    cal->head_stats    = new triattention_head_stats[cal->n_sampled];
+    // v2+: per-layer budget scales. v1 files don't have this block — default to 1.0.
+    cal->layer_budget_scales = new float[cal->num_layers];
+    if (version >= 2) {
+        if (fread(cal->layer_budget_scales, sizeof(float), cal->num_layers, f) != cal->num_layers) {
+            fprintf(stderr, "[TriAttention] ERROR: truncated layer_budget_scales in %s\n", path);
+            delete[] cal->layer_budget_scales;
+            delete cal;
+            fclose(f);
+            return nullptr;
+        }
+    } else {
+        for (uint32_t li = 0; li < cal->num_layers; li++) {
+            cal->layer_budget_scales[li] = 1.0f;
+        }
+    }
 
     const uint32_t fc = cal->freq_count;
 
-    for (uint32_t h = 0; h < cal->n_sampled; h++) {
-        // Read layer and head indices
-        ok = true;
-        ok = ok && fread(&cal->sampled_layer[h], sizeof(uint32_t), 1, f) == 1;
-        ok = ok && fread(&cal->sampled_head[h],  sizeof(uint32_t), 1, f) == 1;
+    // Dense layer-major grid: for li in [0,num_layers) for hi in [0,num_heads).
+    // Entries with all-zero q_abs_mean (SSM layers / uncaptured heads) are skipped.
+    std::vector<uint32_t> sampled_layer;
+    std::vector<uint32_t> sampled_head;
+    std::vector<triattention_head_stats> head_stats;
 
-        if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated head entry %u in %s\n", h, path);
-            // Cleanup partially allocated heads
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
+    std::vector<float> q_mean_real_tmp(fc);
+    std::vector<float> q_mean_imag_tmp(fc);
+    std::vector<float> q_abs_mean_tmp(fc);
+    std::vector<float> mrl_tmp(fc);
+
+    for (uint32_t li = 0; li < cal->num_layers && ok; li++) {
+        for (uint32_t hi = 0; hi < cal->num_attn_heads && ok; hi++) {
+            ok = ok && fread(q_mean_real_tmp.data(), sizeof(float), fc, f) == fc;
+            ok = ok && fread(q_mean_imag_tmp.data(), sizeof(float), fc, f) == fc;
+            ok = ok && fread(q_abs_mean_tmp.data(),  sizeof(float), fc, f) == fc;
+            ok = ok && fread(mrl_tmp.data(),          sizeof(float), fc, f) == fc; // discarded
+
+            if (!ok) {
+                break;
             }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
-        }
 
-        // Validate indices
-        if (cal->sampled_layer[h] >= cal->num_layers ||
-            cal->sampled_head[h] >= cal->num_attn_heads) {
-            fprintf(stderr, "[TriAttention] ERROR: head entry %u has invalid indices (layer=%u, head=%u) in %s\n",
-                    h, cal->sampled_layer[h], cal->sampled_head[h], path);
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
+            bool all_zero = true;
+            for (uint32_t k = 0; k < fc; k++) {
+                if (q_abs_mean_tmp[k] != 0.0f) {
+                    all_zero = false;
+                    break;
+                }
             }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
+            if (all_zero) {
+                continue;
+            }
+
+            triattention_head_stats hs;
+            hs.q_mean_real  = new float[fc];
+            hs.q_mean_imag  = new float[fc];
+            hs.q_abs_mean   = new float[fc];
+            hs.q_mean_abs   = nullptr;  // computed at init time
+            hs.extra_weight = nullptr;  // computed at init time
+            memcpy(hs.q_mean_real, q_mean_real_tmp.data(), fc * sizeof(float));
+            memcpy(hs.q_mean_imag, q_mean_imag_tmp.data(), fc * sizeof(float));
+            memcpy(hs.q_abs_mean,  q_abs_mean_tmp.data(),  fc * sizeof(float));
+
+            sampled_layer.push_back(li);
+            sampled_head.push_back(hi);
+            head_stats.push_back(hs);
         }
+    }
 
-        // Allocate and read per-frequency arrays
-        auto & hs = cal->head_stats[h];
-        hs.q_mean_real  = new float[fc];
-        hs.q_mean_imag  = new float[fc];
-        hs.q_abs_mean   = new float[fc];
-        hs.q_mean_abs   = nullptr;  // computed at init time
-        hs.extra_weight = nullptr;  // computed at init time
-
-        ok = true;
-        ok = ok && fread(hs.q_mean_real, sizeof(float), fc, f) == fc;
-        ok = ok && fread(hs.q_mean_imag, sizeof(float), fc, f) == fc;
-        ok = ok && fread(hs.q_abs_mean,  sizeof(float), fc, f) == fc;
-
-        // Read R_f (validation data — not stored at runtime, just skip)
-        float * r_f_tmp = new float[fc];
-        ok = ok && fread(r_f_tmp, sizeof(float), fc, f) == fc;
-        delete[] r_f_tmp;
-
-        if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, path);
-            // Free this head's arrays
+    if (!ok) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated stats grid in %s\n", path);
+        for (auto & hs : head_stats) {
             delete[] hs.q_mean_real;
             delete[] hs.q_mean_imag;
             delete[] hs.q_abs_mean;
-            // Free previous heads
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
-                delete[] cal->head_stats[j].q_mean_abs;
-                delete[] cal->head_stats[j].extra_weight;
-            }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
         }
+        delete[] cal->layer_budget_scales;
+        delete cal;
+        fclose(f);
+        return nullptr;
     }
 
     fclose(f);
 
-    fprintf(stderr, "[TriAttention] Loaded calibration: model=%s, layers=%u, attn_heads=%u, kv_heads=%u, "
-            "head_dim=%u, sampled=%u, rope_theta=%.1f\n",
-            cal->model_name, cal->num_layers, cal->num_attn_heads,
-            cal->num_kv_heads, cal->head_dim, cal->n_sampled, cal->rope_theta);
+    cal->n_sampled     = (uint32_t) sampled_layer.size();
+    cal->sampled_layer = new uint32_t[cal->n_sampled];
+    cal->sampled_head  = new uint32_t[cal->n_sampled];
+    cal->head_stats    = new triattention_head_stats[cal->n_sampled];
+    memcpy(cal->sampled_layer, sampled_layer.data(), cal->n_sampled * sizeof(uint32_t));
+    memcpy(cal->sampled_head,  sampled_head.data(),  cal->n_sampled * sizeof(uint32_t));
+    for (uint32_t h = 0; h < cal->n_sampled; h++) {
+        cal->head_stats[h] = head_stats[h];
+    }
+
+    cal->model_name[0] = '\0'; // not carried by this file format
+
+    fprintf(stderr, "[TriAttention] Loaded calibration: layers=%u, attn_heads=%u, kv_heads=%u, "
+            "head_dim=%u, sampled=%u, rope_theta=%.1f, version=%u\n",
+            cal->num_layers, cal->num_attn_heads,
+            cal->num_kv_heads, cal->head_dim, cal->n_sampled, cal->rope_theta, version);
 
     return cal;
 }
@@ -305,6 +306,7 @@ static void triattention_free_calibration(triattention_calibration * cal) {
     delete[] cal->sampled_layer;
     delete[] cal->sampled_head;
     delete[] cal->head_stats;
+    delete[] cal->layer_budget_scales;
     delete cal;
 }
 
@@ -539,7 +541,6 @@ void triattention_score_keys(
 //   kv_head_idx — which KV head (0..n_kv_heads-1)
 //   n_cells     — number of cells to dequantize
 //   padded_hd   — padded head dimension (128-aligned for turbo types)
-//   n_kv_heads  — total number of KV heads
 //   need_wht_inv— whether to apply inverse WHT rotation (turbo2/turbo3)
 //
 // Note: This function copies data from potentially GPU-resident tensors
@@ -552,7 +553,6 @@ static void triattention_dequant_kv_head(
     uint32_t             kv_head_idx,
     uint32_t             n_cells,
     uint32_t             padded_hd,
-    uint32_t             n_kv_heads,
     bool                 need_wht_inv)
 {
     const ggml_type k_type = k_tensor->type;
@@ -583,14 +583,14 @@ static void triattention_dequant_kv_head(
         float * dst = need_wht_inv ? dequant_tmp.data() : (out + (size_t)ci * padded_hd);
 
         switch (k_type) {
+            case GGML_TYPE_TURBO2_0:
+                dequantize_row_turbo2_0(quant_buf.data(), dst, padded_hd);
+                break;            
             case GGML_TYPE_TURBO3_0:
                 dequantize_row_turbo3_0(quant_buf.data(), dst, padded_hd);
                 break;
             case GGML_TYPE_TURBO4_0:
                 dequantize_row_turbo4_0(quant_buf.data(), dst, padded_hd);
-                break;
-            case GGML_TYPE_TURBO2_0:
-                dequantize_row_turbo2_0(quant_buf.data(), dst, padded_hd);
                 break;
             case GGML_TYPE_Q8_0:
                 dequantize_row_q8_0(quant_buf.data(), dst, padded_hd);
@@ -641,7 +641,9 @@ triattention_state * triattention_init(
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads)
+    uint32_t rot_dim,
+    uint32_t n_kv_heads,
+    uint32_t rope_style)
 {
     // Load calibration file
     triattention_calibration * cal = triattention_load_calibration(stats_path);
@@ -649,10 +651,15 @@ triattention_state * triattention_init(
         return nullptr;
     }
 
-    // Validate model compatibility
-    if (cal->head_dim != head_dim) {
-        fprintf(stderr, "[TriAttention] ERROR: head_dim mismatch (calibration=%u, model=%u)\n",
-                cal->head_dim, head_dim);
+    // The file doesn't carry rope_style — it's resolved by the caller from the model.
+    cal->rope_style = rope_style;
+
+    // Validate model compatibility. The file's head_dim is the *rotary* dim
+    // (may be < the model's full per-head embedding dim for partial rotary
+    // architectures, e.g. Ornith: rot_dim=64 of head_dim=256).
+    if (cal->head_dim != rot_dim) {
+        fprintf(stderr, "[TriAttention] ERROR: rotary dim mismatch (calibration=%u, model=%u)\n",
+                cal->head_dim, rot_dim);
         triattention_free_calibration(cal);
         return nullptr;
     }
@@ -668,21 +675,23 @@ triattention_state * triattention_init(
                 cal->rope_theta, rope_theta);
     }
 
-    // Allocate state
+    // Allocate state (value-initialized: all scalars zeroed, protected_ranges empty)
     auto * state = new triattention_state();
-    memset(state, 0, sizeof(triattention_state));
 
     state->cal  = cal;
     state->cfg  = *cfg;
     state->kv_size = kv_size;
+    state->head_dim = head_dim;
     state->absolute_position = 0;
     state->prefix_length     = 0;
 
     const uint32_t fc = cal->freq_count;
+    const uint32_t padded_hd = ((head_dim + 127) / 128) * 128;
 
-    // Build precomputed arrays
+    // Build precomputed arrays. omega uses rot_dim (the rotary dim), not the
+    // full head_dim, since RoPE's frequency base only spans the rotated part.
     state->omega = new float[fc];
-    triattention_build_omega(state->omega, fc, head_dim, rope_theta);
+    triattention_build_omega(state->omega, fc, rot_dim, rope_theta);
 
     state->freq_scale_sq = new float[fc];
     triattention_build_freq_scale_sq(state->freq_scale_sq, state->omega, fc);
@@ -702,10 +711,10 @@ triattention_state * triattention_init(
         state->cell_positions[i] = -1;
     }
 
-    // Allocate scratch buffers
+    // Allocate scratch buffers (sized to padded_hd, matching triattention_try_prune()'s usage)
     // These are sized for worst-case (scoring all cells)
-    state->dequant_buf  = new float[(size_t)kv_size * head_dim];
-    state->unrot_buf    = new float[(size_t)kv_size * head_dim];
+    state->dequant_buf  = new float[(size_t)kv_size * padded_hd];
+    state->unrot_buf    = new float[(size_t)kv_size * padded_hd];
     state->score_buf    = new float[(size_t)cal->n_sampled * kv_size];
     state->combined_buf = new float[kv_size];
     state->keep_indices = new uint32_t[cfg->budget];
@@ -852,6 +861,31 @@ bool triattention_should_prune(
     }
 }
 
+void triattention_protect_range(
+    triattention_state * state,
+    int64_t pos_start,
+    int64_t pos_end)
+{
+    if (!state || pos_end <= pos_start) return;
+
+    auto & ranges = state->protected_ranges;
+
+    // Insert in sorted order by start, then merge overlapping/adjacent ranges.
+    auto it = std::lower_bound(ranges.begin(), ranges.end(), std::make_pair(pos_start, pos_end));
+    ranges.insert(it, {pos_start, pos_end});
+
+    std::vector<std::pair<int64_t,int64_t>> merged;
+    merged.reserve(ranges.size());
+    for (const auto & r : ranges) {
+        if (!merged.empty() && r.first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, r.second);
+        } else {
+            merged.push_back(r);
+        }
+    }
+    ranges = std::move(merged);
+}
+
 // ============================================================================
 // Main pruning implementation
 // ============================================================================
@@ -923,7 +957,7 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
     const triattention_config & cfg = state->cfg;
 
     triattention_gpu_config gcfg = {};
-    gcfg.head_dim     = cal->head_dim;
+    gcfg.head_dim     = state->head_dim;
     gcfg.freq_count   = cal->freq_count;
     gcfg.n_kv_heads   = cal->num_kv_heads;
     gcfg.n_sampled    = cal->n_sampled;
@@ -992,7 +1026,7 @@ static void triattention_init_vk(triattention_state * state, ggml_type k_type, c
     const triattention_config & cfg = state->cfg;
 
     triattention_vk_config vcfg = {};
-    vcfg.head_dim     = cal->head_dim;
+    vcfg.head_dim     = state->head_dim;
     vcfg.freq_count   = cal->freq_count;
     vcfg.n_kv_heads   = cal->num_kv_heads;
     vcfg.n_sampled    = cal->n_sampled;
@@ -1054,7 +1088,7 @@ static void triattention_init_mtl(triattention_state * state, ggml_type k_type, 
     const triattention_config & cfg = state->cfg;
 
     triattention_mtl_config mcfg = {};
-    mcfg.head_dim     = cal->head_dim;
+    mcfg.head_dim     = state->head_dim;
     mcfg.freq_count   = cal->freq_count;
     mcfg.n_kv_heads   = cal->num_kv_heads;
     mcfg.n_sampled    = cal->n_sampled;
@@ -1089,132 +1123,6 @@ static void triattention_init_mtl(triattention_state * state, ggml_type k_type, 
 }
 #endif // GGML_USE_METAL
 
-int32_t triattention_prune(
-    triattention_state * state,
-    llama_kv_cache     * kv)
-{
-    if (!state || !kv) return -1;
-
-    double t_start = triattention_time_ms();
-
-    const auto & cfg = state->cfg;
-    const auto * cal = state->cal;
-    const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
-    // Padded head dim for turbo types (always 128-aligned)
-    const uint32_t padded_hd = ((hd + 127) / 128) * 128;
-
-    const uint32_t kv_size = state->kv_size;
-    const uint32_t budget  = cfg.budget;
-
-    // ---- Step 1: Enumerate occupied cells ----
-    // Build lists of occupied cell indices and their positions
-    std::vector<uint32_t> occupied_indices;
-    std::vector<int32_t>  occupied_positions;
-    occupied_indices.reserve(kv_size);
-    occupied_positions.reserve(kv_size);
-
-    for (uint32_t i = 0; i < kv_size; i++) {
-        if (state->cell_positions[i] >= 0) {
-            occupied_indices.push_back(i);
-            occupied_positions.push_back(state->cell_positions[i]);
-        }
-    }
-
-    const uint32_t n_occupied = (uint32_t)occupied_indices.size();
-    if (n_occupied <= budget) {
-        // Nothing to prune
-        return 0;
-    }
-
-    // ---- Step 2: Separate prefix from decode tokens ----
-    // If protect_prefill is on, prefix tokens are always kept
-    std::vector<uint32_t> decode_indices;
-    std::vector<int32_t>  decode_positions;
-    std::vector<uint32_t> prefix_indices;
-
-    if (cfg.protect_prefill && state->prefix_length > 0) {
-        for (uint32_t i = 0; i < n_occupied; i++) {
-            if (occupied_positions[i] < (int32_t)state->prefix_length) {
-                prefix_indices.push_back(i);  // index into occupied arrays
-            } else {
-                decode_indices.push_back(occupied_indices[i]);
-                decode_positions.push_back(occupied_positions[i]);
-            }
-        }
-    } else {
-        decode_indices = occupied_indices;
-        decode_positions = occupied_positions;
-    }
-
-    const uint32_t n_prefix = (uint32_t)prefix_indices.size();
-    const uint32_t n_decode = (uint32_t)decode_indices.size();
-
-    // Effective budget for decode tokens (subtract protected prefix)
-    const uint32_t decode_budget = (budget > n_prefix) ? (budget - n_prefix) : 0;
-
-    if (n_decode <= decode_budget) {
-        return 0;  // Prefix + decode already within budget
-    }
-
-    // ---- Step 3: Score keys for each sampled (layer, head) ----
-    // For each sampled head, dequantize K data, invert RoPE, and compute scores
-
-    // Determine which cache layers exist
-    // The KV cache has map_layer_ids mapping model layer → internal layer index
-    // We access K tensors via the public get_k() interface, but that requires
-    // a ggml_context. For direct tensor access, we use the cache's internal layers.
-
-    // Get K tensor type from the first layer (assume uniform type)
-    // We access the cache's layers array through the public interface
-    const uint32_t n_kv_heads = cal->num_kv_heads;
-
-    // Determine if inverse WHT is needed for this cache type
-    // turbo2_0, turbo3_0: dequant output is in WHT-rotated space → need R^T
-    // turbo4_0: dequant already applies R^T → no additional rotation needed
-    // Others (Q8_0, F16, F32): no WHT rotation at all
-    // We'll detect this per-layer from the tensor type
-
-    for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
-        const uint32_t layer_idx = cal->sampled_layer[sh];
-        const uint32_t attn_head = cal->sampled_head[sh];
-        const uint32_t kv_head   = attn_head / cal->num_kv_groups;
-
-        // Get K tensor for this layer
-        // We need direct access to the cache's internal K tensor.
-        // The get_k() method requires ggml_context which we don't have here.
-        // Instead, we use ggml_backend_tensor_get() on the raw cache tensor.
-        //
-        // Access pattern: the tensor is k_l[layer] with shape:
-        //   ne[0] = n_embd_k_gqa (= n_kv_heads * padded_head_dim)
-        //   ne[1] = kv_size
-        //   ne[2] = n_stream (usually 1)
-        //
-        // For TriAttention we pass the K tensor pointer through the KV cache.
-        // This requires a minor modification to llama_kv_cache to expose it.
-        // For now, we assume the KV cache provides a get_k_tensor() method.
-
-        // TODO: Replace with actual K tensor access once KV cache is modified
-        // For now, this function requires that the k_tensor is passed in separately.
-        // The integration code in llama-kv-cache.cpp will call this with the right tensor.
-        (void)layer_idx;
-        (void)kv_head;
-
-        // Score computations are done in the triattention_prune_with_tensors() function below
-        (void)sh;
-    }
-
-    // This function serves as the public entry point.
-    // The actual implementation that takes tensor pointers is in triattention_prune_impl().
-    // The KV cache integration code calls triattention_prune_impl() with the tensor array.
-
-    // For the public API, return 0 (the real work is in prune_impl called from kv-cache.cpp)
-    double t_end = triattention_time_ms();
-    state->last_prune_time_ms = t_end - t_start;
-
-    return 0;
-}
-
 // ============================================================================
 // Internal pruning implementation (called from KV cache integration)
 // ============================================================================
@@ -1246,7 +1154,7 @@ int32_t triattention_prune_impl(
     const auto & cfg = state->cfg;
     const auto * cal = state->cal;
     const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
+    const uint32_t hd = state->head_dim; // full per-head K dim (buffer stride), not cal->head_dim (rotary)
     const uint32_t padded_hd = ((hd + 127) / 128) * 128;
     const uint32_t budget = cfg.budget;
 
@@ -1285,17 +1193,30 @@ int32_t triattention_prune_impl(
 
     const int32_t recent_threshold = max_pos - (int32_t)cfg.divide_length + 1;
 
+    // Binary search: ranges are sorted, non-overlapping [start,end) intervals.
+    const auto & protected_ranges = state->protected_ranges;
+    auto in_protected_range = [&protected_ranges](int32_t pos) {
+        auto it = std::upper_bound(
+            protected_ranges.begin(), protected_ranges.end(), pos,
+            [](int64_t p, const std::pair<int64_t,int64_t> & r) { return p < r.first; });
+        if (it == protected_ranges.begin()) return false;
+        --it;
+        return (int64_t)pos < it->second;
+    };
+
     std::vector<uint32_t> decode_local_idx;   // index into occupied_indices
     std::vector<uint32_t> decode_cell_idx;    // actual cell indices
     std::vector<int32_t>  decode_positions;
-    uint32_t n_protected = 0;  // prefix + recent protected count
+    uint32_t n_protected = 0;  // prefix + recent + explicitly-protected count
 
     for (uint32_t i = 0; i < n_occupied; i++) {
         const bool is_prefix = cfg.protect_prefill &&
                                occupied_positions[i] < (int32_t)state->prefix_length;
         const bool is_recent = occupied_positions[i] >= recent_threshold;
+        const bool is_range_protected = !protected_ranges.empty() &&
+                               in_protected_range(occupied_positions[i]);
 
-        if (is_prefix || is_recent) {
+        if (is_prefix || is_recent || is_range_protected) {
             n_protected++;
         } else {
             decode_local_idx.push_back(i);
@@ -1523,7 +1444,6 @@ int32_t triattention_prune_impl(
                 kv_head,
                 n_decode,
                 padded_hd,
-                cal->num_kv_heads,
                 need_wht_inv);
 
             // 3b. Invert RoPE → pre-RoPE K
@@ -1553,6 +1473,18 @@ int32_t triattention_prune_impl(
                 state->n_offsets,
                 cfg.agg,
                 cfg.disable_trig);
+        }
+    }
+
+    // ---- Step 3.5: Apply v2 per-layer budget scales as a score weight ----
+    // Approximates the reference scorer's per-layer eviction budget within
+    // llama.cpp's single, position-based (not per-layer) eviction decision.
+    for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
+        const float scale = cal->layer_budget_scales[cal->sampled_layer[sh]];
+        if (scale == 1.0f) continue;
+        float * s = score_buf + (size_t)sh * n_decode;
+        for (uint32_t i = 0; i < n_decode; i++) {
+            s[i] *= scale;
         }
     }
 
@@ -1705,7 +1637,7 @@ int32_t triattention_prune_impl(
                 "%.2f ms [%s], pos=%lld\n",
                 n_occupied, n_occupied - n_evicted, n_evicted, n_protected,
                 (long long)state->prefix_length, (int)cfg.divide_length,
-                state->last_prune_time_ms, state->use_gpu ? "GPU" : "CPU",
+                state->last_prune_time_ms, (state->use_gpu || state->use_vk || state->use_mtl) ? "GPU" : "CPU",
                 (long long)state->absolute_position);
     }
 

@@ -761,6 +761,16 @@ struct common_params {
     bool        triattention_disable_mlr  = false;  // ablation: disable MLR weighting
     bool        triattention_disable_trig = false;  // ablation: norm-only scoring
     bool        triattention_log          = false;  // log pruning events to stderr
+    int32_t     triattention_rope_style   = -1;    // -1=auto (from model), 0=half, 1=interleaved
+    std::string triattention_protect_roles = "system,tool"; // comma list of chat roles whose
+                                                            // message spans are never evicted
+    // LIST OF ROLES THAT ARE CONSIDERED "TOOL" ROLES FOR THE PURPOSE OF TRIATTENTION PROTECTION
+    // "tool,web_search,web_fetch,code_execution,advisor,tool_search,
+    // memory,bash,text_editor,computer,read_file,write_file,edit_file,
+    // run_terminal_command,grep_search,file_search,list_dir,fetch_web_page,
+    // github_api,wolfram_alpha,brave_search,code_interpreter,get_current_weather,
+    // execute_command,python_interpreter"
+                                                             
 };
 
 // call once at the start of a program if it uses libcommon

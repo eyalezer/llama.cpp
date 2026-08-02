@@ -45,10 +45,16 @@ Where:
 
 ### 1. Generate calibration file
 
+Calibration files are produced by the external
+[`triattention-ggml`](https://github.com/) tool (`triattention_calibrate.py`),
+not by a script in this repo:
+
 ```bash
+git clone <triattention-ggml repo url>
+cd triattention-ggml
 pip install torch transformers datasets tqdm numpy
 
-python scripts/calibrate-triattention.py \
+python triattention_calibrate.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --n-tokens 2048 \
     --output models/llama3.1-8b.triattention
@@ -68,11 +74,8 @@ python scripts/calibrate-triattention.py \
 
 ### 3. Validate calibration file
 
-```bash
-python scripts/validate-calibration.py models/llama3.1-8b.triattention
-python scripts/validate-calibration.py models/llama3.1-8b.triattention \
-    --model meta-llama/Llama-3.1-8B-Instruct
-```
+Use `triattention-ggml`'s own validation tooling to inspect a generated file
+before loading it with `--triattention-stats`.
 
 ## CLI arguments
 
@@ -85,6 +88,7 @@ python scripts/validate-calibration.py models/llama3.1-8b.triattention \
 | `--triattention-mode MODE` | global | `global`, `per-kv-head`, or `per-layer-head` |
 | `--triattention-trigger MODE` | interval | `interval` or `slack` |
 | `--triattention-agg MODE` | mean | `mean` or `max` aggregation over offsets |
+| `--triattention-rope-style STYLE` | auto | `auto`, `half`, or `interleaved` — pre-RoPE inversion layout (auto-derived from the model unless overridden) |
 | `--triattention-seed N` | 0 | RNG seed for score tie-breaking (0=deterministic) |
 | `--triattention-normalize` | off | Z-score normalize scores per head before selection |
 | `--triattention-no-protect-prefill` | off | Allow eviction of prompt tokens |
@@ -120,32 +124,42 @@ Adapts naturally to variable-length sequences and batch processing.
 
 ## Calibration file format
 
-Binary format with magic `0x54524941` ("TRIA"), version 1. See the full
-specification in `src/llama-triattention.h`.
+Binary format with magic `0x54524941` ("TRIA"), version 1 or 2, produced by
+the external `triattention-ggml` tool. See the full specification in
+`src/llama-triattention.h`.
 
 ```
-Header (variable length):
-  magic          u32    0x54524941
-  version        u32    1
-  head_dim       u32    e.g. 128
-  num_layers     u32
-  num_attn_heads u32    total attention heads
-  num_kv_heads   u32    GQA KV heads
-  rope_theta     f64
-  rope_style     u32    0=half, 1=interleaved
-  n_sampled      u32    number of calibrated head entries
-  freq_count     u32    head_dim / 2
-  name_len       u32
-  name           char[name_len]
+Fixed header (64 bytes):
+  magic               u32    0x54524941
+  version             u32    1 or 2
+  num_layers          u32
+  num_heads           u32    attention query heads (not KV heads)
+  num_kv_heads        u32    GQA KV heads
+  head_dim            u32
+  freq_count          u32    head_dim / 2
+  rope_theta          f32
+  attn_scale          f32    RoPE scaling metadata (not applied yet)
+  reserved            28 bytes
 
-Per head (repeated n_sampled times):
-  layer_idx      u32
-  head_idx       u32
-  q_mean_real    f32[freq_count]
-  q_mean_imag    f32[freq_count]
-  q_abs_mean     f32[freq_count]
-  r_f            f32[freq_count]   (validation: ||E[q]||/E[||q||])
+v2+ only: per-layer budget scales
+  layer_budget_scales f32[num_layers]
+
+Dense per-(layer, head) stats grid (layer-major):
+  q_mean_real         f32[freq_count]
+  q_mean_imag         f32[freq_count]
+  q_abs_mean          f32[freq_count]
+  mrl                 f32[freq_count]   (discarded)
 ```
+
+`rope_style` is not stored in the file — it's auto-derived from the model's
+own RoPE type at init time (override with `--triattention-rope-style`).
+Entries with all-zero `q_abs_mean` (SSM/hybrid layers, or heads the
+calibration script didn't capture) are skipped when the loader builds its
+sampled-head list. `layer_budget_scales` (v2) is applied as a per-sampled-head
+score weight before combining scores, approximating the reference scorer's
+per-layer eviction budget — it is not a literal independent per-layer eviction
+budget, since llama.cpp's KV cache eviction is position-based and shared
+across all layers in a `llama_kv_cache` instance.
 
 ## Architecture
 
@@ -157,8 +171,7 @@ Per head (repeated n_sampled times):
 | `src/llama-triattention.cpp` | CPU implementation — scoring, pruning, calibration loading |
 | `ggml/src/ggml-cuda/triattention-score.cu` | CUDA scoring kernel — GPU-accelerated importance scoring |
 | `ggml/src/ggml-cuda/triattention-score.cuh` | CUDA kernel header |
-| `scripts/calibrate-triattention.py` | Calibration script — collects Q stats from HF models |
-| `scripts/validate-calibration.py` | Validation script — reads and checks `.triattention` files |
+| `triattention_calibrate.py` (external `triattention-ggml` repo) | Calibration tool — collects Q stats from HF models, writes the `.triattention` file |
 
 ### Integration points
 
@@ -168,7 +181,7 @@ Per head (repeated n_sampled times):
    - `seq_add()` — updates positions on cache shifts
 
 2. **CLI registration** (`common/arg.cpp`):
-   All 13 `--triattention-*` arguments registered for SERVER and CLI examples
+   All `--triattention-*` arguments registered for SERVER and CLI examples
 
 3. **Public API** (`include/llama.h`):
    `llama_triattention_init()` — initializes TriAttention on a context

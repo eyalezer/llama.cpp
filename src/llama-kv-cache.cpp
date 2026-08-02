@@ -1537,16 +1537,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // TriAttention: set prefix length and check if pruning should trigger
     if (triattention_st != nullptr) {
-        // Set prefix_length once on the first prompt batch (contains position 0, >1 token).
-        // This enables prefix protection during pruning so prompt tokens are never evicted.
-        if (triattention_st->prefix_length == 0 && ubatch.n_tokens > 1) {
-            bool has_pos_zero = false;
+        // Extend prefix_length over every prefill ubatch (n_tokens > 1) so the whole
+        // initial prompt is protected, not just its first n_ubatch-sized chunk; a
+        // decode ubatch (n_tokens == 1) means prefill is over, so stop extending it.
+        if (ubatch.n_tokens > 1) {
             llama_pos max_batch_pos = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                if (ubatch.pos[i] == 0) has_pos_zero = true;
                 if (ubatch.pos[i] > max_batch_pos) max_batch_pos = ubatch.pos[i];
             }
-            if (has_pos_zero) {
+            if (max_batch_pos + 1 > triattention_st->prefix_length) {
                 triattention_st->prefix_length = max_batch_pos + 1;
             }
         }
@@ -3101,7 +3100,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache: TriAttention integration
 //
 
-void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg) {
+void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg, uint32_t rope_style) {
     if (!stats_path || stats_path[0] == '\0') {
         return;
     }
@@ -3113,9 +3112,10 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
     const uint32_t kv_size = v_cells.empty() ? 0 : (uint32_t)v_cells[0].size();
     const double rope_theta = (double)hparams.rope_freq_base_train;
     const uint32_t head_dim = hparams.n_embd_head_k(0);
+    const uint32_t rot_dim = hparams.n_rot(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
 
-    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads);
+    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, rot_dim, n_kv_heads, rope_style);
     if (!triattention_st) {
         LLAMA_LOG_ERROR("%s: failed to initialize TriAttention from %s\n", __func__, stats_path);
     }
@@ -3179,6 +3179,13 @@ int32_t llama_kv_cache::triattention_try_prune() {
 
 bool llama_kv_cache::has_triattention() const {
     return triattention_st != nullptr;
+}
+
+void llama_kv_cache::triattention_protect_range(int64_t pos_start, int64_t pos_end) {
+    if (!triattention_st) {
+        return;
+    }
+    ::triattention_protect_range(triattention_st, pos_start, pos_end);
 }
 
 //
