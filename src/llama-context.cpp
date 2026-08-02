@@ -4014,7 +4014,8 @@ int32_t llama_triattention_init(
                         bool   disable_mlr,
                         bool   disable_trig,
                         bool   enable_logging,
-                     int32_t   rope_style) {
+                     int32_t   rope_style,
+                     int32_t   prefix_cap) {
     if (!ctx || !stats_path || stats_path[0] == '\0') {
         return -1;
     }
@@ -4063,6 +4064,7 @@ int32_t llama_triattention_init(
     cfg.seed             = seed;
     cfg.normalize_scores = normalize_scores;
     cfg.protect_prefill  = protect_prefill;
+    cfg.prefix_cap       = (uint32_t)(prefix_cap > 0 ? prefix_cap : 0);
     cfg.disable_mlr      = disable_mlr;
     cfg.disable_trig     = disable_trig;
     cfg.enable_logging   = enable_logging;

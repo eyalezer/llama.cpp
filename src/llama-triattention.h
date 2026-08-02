@@ -150,6 +150,9 @@ struct triattention_config {
 
     bool normalize_scores;        // Z-score normalize per head before selection (default: false)
     bool protect_prefill;         // Never evict initial prompt tokens (default: true)
+    uint32_t prefix_cap;          // Max tokens of the initial prompt protected as prefix;
+                                   // 0 = auto (budget / 2), prevents a huge single-turn
+                                   // prompt from consuming the whole eviction budget
     bool disable_mlr;             // Ablation: use q_abs_mean directly as extra_weight (default: false)
     bool disable_trig;            // Ablation: drop trigonometric term, norm-only scoring (default: false)
     bool enable_logging;          // Log pruning events to stderr (default: false)

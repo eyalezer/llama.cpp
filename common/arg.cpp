@@ -4678,6 +4678,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--triattention-prefix-cap"}, "N",
+        "max tokens of the initial prompt protected as prefix, 0 = auto: budget/2 (default: 0)",
+        [](common_params & params, int value) {
+            params.triattention_prefix_cap = value;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_PREFIX_CAP").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--triattention-disable-mlr"},
         "ablation: disable MLR weighting in norm term",
         [](common_params & params) {

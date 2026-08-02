@@ -1540,13 +1540,22 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         // Extend prefix_length over every prefill ubatch (n_tokens > 1) so the whole
         // initial prompt is protected, not just its first n_ubatch-sized chunk; a
         // decode ubatch (n_tokens == 1) means prefill is over, so stop extending it.
+        // Capped (default: budget/2) so a single huge prompt can't consume the whole
+        // eviction budget and disable pruning for the rest of prefill.
         if (ubatch.n_tokens > 1) {
             llama_pos max_batch_pos = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
                 if (ubatch.pos[i] > max_batch_pos) max_batch_pos = ubatch.pos[i];
             }
-            if (max_batch_pos + 1 > triattention_st->prefix_length) {
-                triattention_st->prefix_length = max_batch_pos + 1;
+            const llama_pos prefix_cap = triattention_st->cfg.prefix_cap > 0
+                ? (llama_pos) triattention_st->cfg.prefix_cap
+                : (llama_pos) (triattention_st->cfg.budget / 2);
+            llama_pos new_prefix_length = max_batch_pos + 1;
+            if (new_prefix_length > prefix_cap) {
+                new_prefix_length = prefix_cap;
+            }
+            if (new_prefix_length > triattention_st->prefix_length) {
+                triattention_st->prefix_length = new_prefix_length;
             }
         }
 

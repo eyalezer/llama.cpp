@@ -758,6 +758,7 @@ struct common_params {
     int32_t     triattention_seed         = 0;     // RNG seed for tie-breaking (-1 to disable)
     bool        triattention_normalize    = false;  // z-score normalize per head
     bool        triattention_protect_prefill = true; // never evict prompt tokens
+    int32_t     triattention_prefix_cap   = 0;     // cap on protected prefix tokens (0 = auto: budget/2)
     bool        triattention_disable_mlr  = false;  // ablation: disable MLR weighting
     bool        triattention_disable_trig = false;  // ablation: norm-only scoring
     bool        triattention_log          = false;  // log pruning events to stderr

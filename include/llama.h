@@ -806,6 +806,7 @@ extern "C" {
     // agg: 0=mean, 1=max
     // seed: RNG seed for tie-breaking noise (-1 to disable)
     // rope_style: -1=auto (derived from the model's own RoPE type), 0=half, 1=interleaved
+    // prefix_cap: max tokens of the initial prompt protected as prefix, 0 = auto (budget/2)
     // Returns 0 on success, -1 on failure.
     LLAMA_API int32_t llama_triattention_init(
             struct llama_context * ctx,
@@ -822,7 +823,8 @@ extern "C" {
                             bool   disable_mlr,
                             bool   disable_trig,
                             bool   enable_logging,
-                         int32_t   rope_style);
+                         int32_t   rope_style,
+                         int32_t   prefix_cap);
 
     // Mark [pos_start, pos_end) as never-evict by TriAttention (e.g. tool-call
     // results or system-prompt spans the caller wants to preserve verbatim).
