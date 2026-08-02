@@ -28,6 +28,8 @@ static const std::string ARG_SECOND = "BB_ARG_SND_BB";
 static const std::string USER_MSG = "U_USER_MSG Hello END_U";
 static const std::string USER_MSG_TWO = "V_USER_MSG Hello END_V";
 static const std::string ASSISTANT_MSG = "A_ASST_MSG I can help END_A";
+static const std::string SYSTEM_MSG = "S_SYS_MSG Instructions END_S";
+static const std::string TOOL_MSG = "T_TOOL_MSG Result END_T";
 static const std::string THINKING_CONTENT = "REASON_PART I am thinking END_R";
 static const std::string CALL_ID_001 = "call00001";
 static const std::string CALL_ID_002 = "call00002";
@@ -253,6 +255,8 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
     tools = analyze_tools(jinja_caps.supports_tool_calls ? analyze_tools(tmpl, jinja_caps, reasoning) : analyze_tools());
     assistant_start = detect_assistant_start_marker(tmpl);
     user_start = detect_user_start_marker(tmpl);
+    system_start = detect_system_start_marker(tmpl);
+    tool_start = detect_tool_start_marker(tmpl);
     collect_preserved_tokens();
 
     for (auto & workaround : workarounds) {
@@ -448,6 +452,110 @@ std::string autoparser::detect_user_start_marker(const common_chat_template & tm
         result << mrk.value;
     }
     return trim_whitespace(result.str());
+}
+
+// Shared with detect_system_start_marker/detect_tool_start_marker: strips leading
+// end/close markers and leading blank text segments from a candidate marker prefix.
+static std::string extract_marker_prefix(const std::string & candidate) {
+    auto candidate_split = segmentize_markers(candidate);
+    std::stringstream result;
+    bool encountered_marker = false;
+    for (const auto & mrk : candidate_split) {
+        std::string lower_mrk = std::string(mrk.value);
+        std::transform(lower_mrk.begin(), lower_mrk.end(), lower_mrk.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        if (mrk.type == segment_type::MARKER && !encountered_marker &&
+            (lower_mrk.find("end") != std::string::npos || lower_mrk.find("close") != std::string::npos)) {
+            continue;
+        }
+        if (mrk.type == segment_type::TEXT && !encountered_marker && trim_whitespace(mrk.value).empty()) {
+            continue;
+        }
+        encountered_marker |= mrk.type == segment_type::MARKER;
+        result << mrk.value;
+    }
+    return trim_whitespace(result.str());
+}
+
+std::string autoparser::detect_system_start_marker(const common_chat_template & tmpl) {
+    json user_msg = json{
+        { "role",    "user"   },
+        { "content", USER_MSG }
+    };
+
+    json system_msg = json{
+        { "role",    "system"    },
+        { "content", SYSTEM_MSG }
+    };
+
+    template_params params;
+    params.messages              = json::array({ user_msg });
+    params.add_generation_prompt = false;
+    params.enable_thinking       = true;
+
+    auto comparison = compare_variants(
+        tmpl, params, [&](template_params & p) {
+            p.messages = json::array({ system_msg, user_msg });
+        }
+    );
+
+    if (!comparison) {
+        LOG_DBG(ANSI_ORANGE "%s: Template application failed, skipping system start detection\n" ANSI_RESET, __func__);
+        return "";
+    }
+
+    auto sysmsg = comparison->diff.right;
+    if (sysmsg.find(SYSTEM_MSG) == std::string::npos) {
+        LOG_DBG(ANSI_ORANGE "%s: Did not find system message in system message block, aborting detection\n" ANSI_RESET, __func__);
+        return "";
+    }
+
+    auto candidate = sysmsg.substr(0, sysmsg.find(SYSTEM_MSG));
+    return extract_marker_prefix(candidate);
+}
+
+std::string autoparser::detect_tool_start_marker(const common_chat_template & tmpl) {
+    json user_msg = json{
+        { "role",    "user"   },
+        { "content", USER_MSG }
+    };
+
+    json assistant_with_call = json{
+        { "role",       "assistant"                                                                 },
+        { "content",    ""                                                                          },
+        { "tool_calls", json::array({ build_tool_call(FUN_FIRST, json{ { ARG_FIRST, "XXXX" } }, CALL_ID_001) }) }
+    };
+
+    json tool_msg = json{
+        { "role",         "tool"       },
+        { "content",      TOOL_MSG     },
+        { "tool_call_id", CALL_ID_001  }
+    };
+
+    template_params params;
+    params.messages              = json::array({ user_msg, assistant_with_call });
+    params.add_generation_prompt = false;
+    params.enable_thinking       = true;
+
+    auto comparison = compare_variants(
+        tmpl, params, [&](template_params & p) {
+            p.messages = json::array({ user_msg, assistant_with_call, tool_msg });
+        }
+    );
+
+    if (!comparison) {
+        LOG_DBG(ANSI_ORANGE "%s: Template application failed, skipping tool start detection\n" ANSI_RESET, __func__);
+        return "";
+    }
+
+    auto toolmsg = comparison->diff.right;
+    if (toolmsg.find(TOOL_MSG) == std::string::npos) {
+        LOG_DBG(ANSI_ORANGE "%s: Did not find tool message in tool message block, aborting detection\n" ANSI_RESET, __func__);
+        return "";
+    }
+
+    auto candidate = toolmsg.substr(0, toolmsg.find(TOOL_MSG));
+    return extract_marker_prefix(candidate);
 }
 
 analyze_reasoning::analyze_reasoning(const common_chat_template & tmpl, bool supports_tools)

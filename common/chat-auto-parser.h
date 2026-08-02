@@ -382,6 +382,8 @@ struct autoparser {
     jinja::caps          jinja_caps;
     std::string          user_start;
     std::string          assistant_start;
+    std::string          system_start;
+    std::string          tool_start;
     analyze_reasoning    reasoning;
     analyze_content      content;
     analyze_tools        tools;
@@ -396,6 +398,10 @@ struct autoparser {
     // Find the starting marker for the user message and assistant message
     std::string detect_user_start_marker(const common_chat_template & tmpl);
     std::string detect_assistant_start_marker(const common_chat_template & tmpl);
+    // Find the starting marker for the system message and tool-response message
+    // (needed so callers, e.g. --triattention-protect-roles, can locate & protect these spans)
+    std::string detect_system_start_marker(const common_chat_template & tmpl);
+    std::string detect_tool_start_marker(const common_chat_template & tmpl);
 
     // Run full differential analysis on a template
     void analyze_template(const common_chat_template & tmpl);
