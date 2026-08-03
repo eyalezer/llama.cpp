@@ -3462,6 +3462,12 @@ private:
                                             (int64_t) span.pos,
                                             (int64_t) (span.pos + span.len));
                                 }
+                                if (params_base.triattention_log) {
+                                    SLT_INF(slot, "message span: role=%s pos=%" PRId64 " len=%" PRId64 " protected=%d\n",
+                                            common_chat_role_to_string(span.role),
+                                            (int64_t) span.pos, (int64_t) span.len,
+                                            (int) protect_roles.count(span.role));
+                                }
                             }
                         }
                     }

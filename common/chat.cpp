@@ -3143,6 +3143,12 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
             delimiters.add(COMMON_CHAT_ROLE_TOOL, autoparser.tool_start);
         }
 
+        LOG_DBG("%s: autoparser markers: user_start=%s assistant_start=%s system_start=%s tool_start=%s\n",
+                __func__,
+                autoparser.user_start.c_str(), autoparser.assistant_start.c_str(),
+                autoparser.system_start.empty() ? "<empty>" : autoparser.system_start.c_str(),
+                autoparser.tool_start.empty() ? "<empty>" : autoparser.tool_start.c_str());
+
         auto_params.message_delimiters = std::move(delimiters);
 
         auto_params.supports_thinking = autoparser.reasoning.mode != autoparser::reasoning_mode::NONE;
