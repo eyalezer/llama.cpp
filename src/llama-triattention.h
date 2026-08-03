@@ -16,39 +16,49 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <utility>
+#include <vector>
 
 // Forward declarations
 class  llama_kv_cache;
 struct llama_hparams;
 
 // ============================================================================
-// Binary calibration file format (.triattention)
+// Binary calibration file format (.triattention, TRIA v1/v2)
 // ============================================================================
 //
-// Header:
-//   magic          uint32  0x54524941 ("TRIA")
-//   version        uint32  1
-//   head_dim       uint32  e.g. 128
-//   num_layers     uint32  e.g. 36
-//   num_attn_heads uint32  e.g. 36  (total attention heads, not KV heads)
-//   num_kv_heads   uint32  e.g. 4   (grouped query attention KV heads)
-//   rope_theta     float64 e.g. 10000.0
-//   rope_style     uint32  0=half, 1=interleaved
-//   n_sampled      uint32  number of (layer, head) pairs with stats
-//   freq_count     uint32  head_dim / 2
-//   name_len       uint32  length of model name string (including null)
-//   name           char[name_len]  UTF-8 null-terminated model name
+// Format adopted from the external triattention-ggml calibration tool. Unlike
+// the old (never-produced) sparse format, this one is dense: every (layer,
+// head) pair has an entry, with all-zero q_abs_mean marking SSM/non-attention
+// layers or heads that weren't captured (skipped when building sampled_*).
+// rope_style is not stored in the file — it's resolved from the model's own
+// RoPE type at init time (see triattention_init below).
 //
-// Per sampled head (repeated n_sampled times):
-//   layer_idx      uint32
-//   head_idx       uint32  (attention head index, 0..num_attn_heads-1)
+// Fixed header (64 bytes):
+//   magic          uint32  0x54524941 ("TRIA")
+//   version        uint32  1 or 2
+//   num_layers     uint32
+//   num_heads      uint32  attention query-head count (not KV heads)
+//   num_kv_heads   uint32  GQA KV heads
+//   head_dim       uint32
+//   freq_count     uint32  head_dim / 2
+//   rope_theta     float32
+//   attn_scale     float32  RoPE attention scaling metadata (not applied yet)
+//   reserved       28 bytes, ignored
+//
+// v2+ layer budget scales block (present only when version >= 2):
+//   layer_budget_scales  float32[num_layers]
+//
+// Per-head stats block (layer-major: for li in [0,num_layers) for hi in [0,num_heads)):
 //   q_mean_real    float32[freq_count]  Re(E[q_f])
 //   q_mean_imag    float32[freq_count]  Im(E[q_f])
 //   q_abs_mean     float32[freq_count]  E[||q_f||]
-//   r_f            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (validation)
+//   mrl            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (discarded)
 
-#define TRIATTENTION_MAGIC   0x54524941u  // "TRIA" in little-endian
-#define TRIATTENTION_VERSION 1u
+#define TRIATTENTION_MAGIC        0x54524941u  // "TRIA" in little-endian
+#define TRIATTENTION_VERSION_MIN  1u
+#define TRIATTENTION_VERSION_MAX  2u
+#define TRIATTENTION_HEADER_SIZE  64
 
 // ============================================================================
 // Enums
@@ -116,12 +126,14 @@ struct triattention_calibration {
     double   rope_theta;
     uint32_t rope_style;          // 0 = half, 1 = interleaved
     uint32_t freq_count;          // = head_dim / 2
-    uint32_t n_sampled;           // number of (layer, head) pairs
+    uint32_t n_sampled;           // number of (layer, head) pairs with non-zero stats
 
     // Per sampled head arrays — length n_sampled
     uint32_t * sampled_layer;     // [n_sampled]  layer index
     uint32_t * sampled_head;      // [n_sampled]  attention head index
     triattention_head_stats * head_stats;  // [n_sampled]
+
+    float * layer_budget_scales;  // [num_layers]  v2 per-layer budget weight (1.0 if v1)
 
     char model_name[256];
 };
@@ -138,9 +150,14 @@ struct triattention_config {
 
     bool normalize_scores;        // Z-score normalize per head before selection (default: false)
     bool protect_prefill;         // Never evict initial prompt tokens (default: true)
+    uint32_t prefix_cap;          // Max tokens of the initial prompt protected as prefix;
+                                   // 0 = auto (budget / 2), prevents a huge single-turn
+                                   // prompt from consuming the whole eviction budget
     bool disable_mlr;             // Ablation: use q_abs_mean directly as extra_weight (default: false)
     bool disable_trig;            // Ablation: drop trigonometric term, norm-only scoring (default: false)
     bool enable_logging;          // Log pruning events to stderr (default: false)
+    bool prune_during_prefill;    // Allow the prune trigger to fire on prefill ubatches (n_tokens > 1),
+                                   // not just decode; disabling defers all eviction until decode (default: true)
 
     int32_t seed;                 // RNG seed for tie-breaking noise (-1 = disabled, default: 0)
 };
@@ -152,8 +169,17 @@ struct triattention_state {
 
     // Inference tracking
     int64_t  absolute_position;   // Monotonically increasing token counter
+    int64_t  last_prune_position; // absolute_position as of the last successful prune (INTERVAL trigger)
     int64_t  prefix_length;       // Prompt length (protected if protect_prefill)
     uint32_t kv_size;             // Total KV cache capacity (from cache init)
+    uint32_t head_dim;            // Full per-head K embedding dim (buffer stride) —
+                                   // distinct from cal->head_dim, which is the rotary
+                                   // dim (partial rotary support, e.g. Ornith rotary=64/256)
+
+    // Explicitly protected position ranges (e.g. tool-call results, system prompt
+    // spans), sorted and merged, half-open [start,end). Never evicted regardless
+    // of score. Set via triattention_protect_range().
+    std::vector<std::pair<int64_t,int64_t>> protected_ranges;
 
     // Precomputed arrays (allocated once at init)
     float *   omega;              // [freq_count]  RoPE frequencies: theta^(-2f/d)
@@ -180,6 +206,18 @@ struct triattention_state {
     bool     use_gpu;              // true once GPU state is successfully initialized
     bool     gpu_init_tried;       // prevents re-trying init on failure
 
+    // Vulkan scoring state (lazily initialized on first prune, mutually exclusive with CUDA)
+    void *   d_vk_state;            // triattention_vk_state* — device calibration data
+    void *   vk_backend;            // ggml_backend_t owned by this state, for one-off dispatch
+    bool     use_vk;                // true once Vulkan state is successfully initialized
+    bool     vk_init_tried;         // prevents re-trying init on failure
+
+    // Metal scoring state (lazily initialized on first prune, mutually exclusive with CUDA/Vulkan)
+    void *   d_mtl_state;           // triattention_mtl_state* — device calibration data
+    void *   mtl_backend;           // ggml_backend_t owned by this state, for one-off dispatch
+    bool     use_mtl;               // true once Metal state is successfully initialized
+    bool     mtl_init_tried;        // prevents re-trying init on failure
+
     // Monitoring statistics
     uint64_t total_prune_calls;
     uint64_t total_tokens_evicted;
@@ -204,15 +242,22 @@ extern "C" {
 //   cfg         — runtime configuration (copied into state)
 //   kv_size     — total KV cache capacity (number of cell slots)
 //   rope_theta  — model's RoPE theta for validation against calibration
-//   head_dim    — model's attention head dimension for validation
+//   head_dim    — model's full per-head K embedding dim (buffer/stride sizing)
+//   rot_dim     — model's rotary dim (may be < head_dim for partial rotary);
+//                 validated against the calibration file's head_dim field and
+//                 used for the RoPE frequency (omega) computation
 //   n_kv_heads  — model's number of KV heads for validation
+//   rope_style  — 0=half, 1=interleaved; the file no longer carries this, so
+//                 the caller resolves it from the model's own RoPE type
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads);
+    uint32_t rot_dim,
+    uint32_t n_kv_heads,
+    uint32_t rope_style);
 
 // Free all memory associated with a TriAttention state.
 // Safe to call with nullptr.
@@ -293,29 +338,6 @@ void triattention_score_keys(
     enum triattention_agg agg,
     bool disable_trig);
 
-// ============================================================================
-// Main pruning entry point
-// ============================================================================
-
-// Execute one round of TriAttention pruning on the KV cache.
-// Called when trigger conditions are met (see triattention_should_prune).
-//
-// Algorithm overview:
-//   1. Enumerate occupied cells → indices + positions
-//   2. Separate protected prefix from decode tokens
-//   3. For each sampled (layer, head):
-//      a. Dequantize K from cache → float
-//      b. Invert RoPE → pre-RoPE K
-//      c. Score keys
-//   4. Combine scores across heads (mode-dependent)
-//   5. Select top-B tokens to keep
-//   6. Evict all others via cells.rm()
-//
-// Returns: number of cells evicted, or 0 if no pruning needed, or -1 on error.
-int32_t triattention_prune(
-    triattention_state * state,
-    llama_kv_cache     * kv);
-
 // Check whether pruning should trigger based on current cache state.
 // Called after each token is added to the cache.
 //
@@ -325,6 +347,15 @@ int32_t triattention_prune(
 bool triattention_should_prune(
     const triattention_state * state,
     uint32_t n_used);
+
+// Mark [pos_start, pos_end) as never-evict, regardless of score (e.g. for
+// tool-call results or system-prompt spans the server wants to preserve
+// verbatim). Merges with any existing overlapping/adjacent ranges. No-op if
+// state is nullptr or the range is empty.
+void triattention_protect_range(
+    triattention_state * state,
+    int64_t pos_start,
+    int64_t pos_end);
 
 // ============================================================================
 // Position tracking hooks

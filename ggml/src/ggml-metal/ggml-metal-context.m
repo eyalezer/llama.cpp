@@ -236,6 +236,10 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx) {
+    return ctx->dev;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {

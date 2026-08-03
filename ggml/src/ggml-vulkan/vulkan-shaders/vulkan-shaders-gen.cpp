@@ -868,6 +868,9 @@ void process_shaders() {
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
 
+    // TriAttention KV-cache eviction scoring (K_TYPE_ID/NEED_WHT_INV/FREQ_COUNT set via specialization constants)
+    string_to_spv("triattention_score", "triattention_score.comp", {});
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

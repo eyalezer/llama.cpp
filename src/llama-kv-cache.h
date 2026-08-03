@@ -207,7 +207,10 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // is_trial: true when called from prepare()'s speculative pass, which unconditionally
+    // rolls back cells/heads afterward - TriAttention side effects must be skipped in that
+    // case, since they are not part of that rollback and would otherwise become permanent.
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_trial = false);
 
     //
     // input API
@@ -236,7 +239,8 @@ public:
 
     // Initialize TriAttention on this cache. Called after construction.
     // Does nothing if stats_path is nullptr or empty.
-    void init_triattention(const char * stats_path, const triattention_config * cfg);
+    // rope_style: 0=half, 1=interleaved — resolved by the caller from the model's RoPE type.
+    void init_triattention(const char * stats_path, const triattention_config * cfg, uint32_t rope_style);
 
     // Attempt TriAttention pruning if conditions are met (trigger check + prune).
     // Called automatically from apply_ubatch(). Can also be called explicitly.
@@ -245,6 +249,11 @@ public:
 
     // Check if TriAttention is active on this cache.
     bool has_triattention() const;
+
+    // Mark [pos_start, pos_end) as never-evict by TriAttention (e.g. tool-call
+    // results or system-prompt spans the server wants to preserve verbatim).
+    // No-op if TriAttention is not active on this cache.
+    void triattention_protect_range(int64_t pos_start, int64_t pos_end);
 
 private:
     const llama_model & model;

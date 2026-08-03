@@ -5,7 +5,7 @@
 ### llama_triattention_init
 
 ```c
-LLAMA_API bool llama_triattention_init(
+LLAMA_API int32_t llama_triattention_init(
     struct llama_context * ctx,
     const char * stats_path,
     int32_t  budget,
@@ -15,11 +15,14 @@ LLAMA_API bool llama_triattention_init(
     int32_t  trigger,
     int32_t  agg,
     int32_t  seed,
-    bool     normalize,
+    bool     normalize_scores,
     bool     protect_prefill,
     bool     disable_mlr,
     bool     disable_trig,
-    bool     enable_logging);
+    bool     enable_logging,
+    int32_t  rope_style,
+    int32_t  prefix_cap,
+    bool     prune_during_prefill);
 ```
 
 Initialize TriAttention KV cache eviction on a context. Must be called after
@@ -38,14 +41,32 @@ context creation and before inference begins.
 | `trigger` | `int32_t` | 0=interval, 1=slack |
 | `agg` | `int32_t` | 0=mean, 1=max aggregation |
 | `seed` | `int32_t` | RNG seed for tie-breaking (0=deterministic) |
-| `normalize` | `bool` | Z-score normalize before selection |
+| `normalize_scores` | `bool` | Z-score normalize before selection |
 | `protect_prefill` | `bool` | Protect prompt tokens from eviction |
 | `disable_mlr` | `bool` | Ablation: disable MLR weighting |
 | `disable_trig` | `bool` | Ablation: norm-only scoring |
 | `enable_logging` | `bool` | Log pruning events to stderr |
+| `rope_style` | `int32_t` | -1=auto (derived from model), 0=half, 1=interleaved |
+| `prefix_cap` | `int32_t` | Max tokens of the initial prompt protected as prefix, 0=auto (budget/2) |
+| `prune_during_prefill` | `bool` | Allow eviction to fire during prefill ubatches, not just decode |
 
-**Returns:** `true` if initialization succeeded, `false` on error (bad file,
-model mismatch, context doesn't use KV cache).
+**Returns:** `0` on success, `-1` on error (bad file, model mismatch, context
+doesn't use KV cache).
+
+---
+
+### llama_triattention_protect_range
+
+```c
+LLAMA_API void llama_triattention_protect_range(
+    struct llama_context * ctx,
+    int64_t  pos_start,
+    int64_t  pos_end);
+```
+
+Marks `[pos_start, pos_end)` as never-evict by TriAttention (e.g. tool-call
+results or system-prompt spans the caller wants to preserve verbatim). No-op
+if TriAttention is not initialized on this context's KV cache.
 
 ---
 
@@ -61,7 +82,8 @@ triattention_state * triattention_init(
     uint32_t kv_size,
     double   rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads);
+    uint32_t n_kv_heads,
+    uint32_t rope_style);
 
 // Free all resources
 void triattention_free(triattention_state * state);

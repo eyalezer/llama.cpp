@@ -984,6 +984,20 @@ typedef struct {
 } ggml_metal_kargs_turbo_wht;
 
 typedef struct {
+    int32_t  k_type_id;         // 0=F32 1=F16 2=Q8_0 3=TURBO2_0 4=TURBO3_0 5=TURBO4_0
+    int32_t  need_wht_inv;      // apply inverse WHT rotation after dequant
+    uint32_t row_bytes;         // byte stride between consecutive K rows (cells)
+    uint32_t head_offset_bytes; // byte offset of this head within a row
+    uint32_t padded_hd;         // padded head_dim (only 128 supported for WHT path)
+    uint32_t n_cells;           // number of candidate cells in this batch
+    int32_t  round_start;       // starting position round (for inverse RoPE)
+    uint32_t freq_count;        // number of frequency bins (head_dim / 2)
+    uint32_t n_offsets;         // number of calibration offsets
+    uint32_t agg_mode;          // 0 = mean, 1 = max
+    uint32_t disable_trig;      // skip trig-based scoring term
+} ggml_metal_kargs_triattention_score;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

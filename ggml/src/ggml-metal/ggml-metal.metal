@@ -3757,6 +3757,216 @@ kernel void kernel_turbo_wht(
     }
 }
 
+// ===== TriAttention scoring kernel (Metal port of the CUDA/Vulkan TriAttention scoring op) =====
+// One threadgroup scores one candidate cell; threads_per_threadgroup == freq_count (head_dim / 2).
+// K-type is a runtime branch (kargs.k_type_id) rather than a compile-time specialization, since
+// Metal dispatch already allows a runtime threadgroup size (unlike Vulkan's local_size_x spec constant).
+
+#define TRIATTN_K_TYPE_F32      0
+#define TRIATTN_K_TYPE_F16      1
+#define TRIATTN_K_TYPE_Q8_0     2
+#define TRIATTN_K_TYPE_TURBO2_0 3
+#define TRIATTN_K_TYPE_TURBO3_0 4
+#define TRIATTN_K_TYPE_TURBO4_0 5
+
+static inline uint triattn_read_u8(device const uchar * k_bytes, uint byte_off) {
+    return (uint) k_bytes[byte_off];
+}
+
+static inline float triattn_read_f32(device const uchar * k_bytes, uint byte_off) {
+    uint b0 = triattn_read_u8(k_bytes, byte_off);
+    uint b1 = triattn_read_u8(k_bytes, byte_off + 1);
+    uint b2 = triattn_read_u8(k_bytes, byte_off + 2);
+    uint b3 = triattn_read_u8(k_bytes, byte_off + 3);
+    uint bits = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    return as_type<float>(bits);
+}
+
+static inline float triattn_read_f16(device const uchar * k_bytes, uint byte_off) {
+    uint lo = triattn_read_u8(k_bytes, byte_off);
+    uint hi = triattn_read_u8(k_bytes, byte_off + 1);
+    ushort bits = (ushort) (lo | (hi << 8));
+    return (float) as_type<half>(bits);
+}
+
+// Q8_0: block of 32 elements, layout { half d; int8 qs[32]; }, block size = 34 bytes.
+static inline float triattn_dequant_q8_0(device const uchar * k_bytes, uint row_byte_off, uint elem) {
+    const uint blk = elem / 32u;
+    const uint off = elem % 32u;
+    const uint blk_byte_off = row_byte_off + blk * 34u;
+    const float d = triattn_read_f16(k_bytes, blk_byte_off);
+    const int q = (int) ((char) triattn_read_u8(k_bytes, blk_byte_off + 2u + off));
+    return (float) q * d;
+}
+
+// block_turbo2_0 { half norm; uint8 qs[32]; } = 34 bytes, 128 elems/block (padded_hd == 128 assumed).
+static inline float triattn_dequant_turbo2_0(device const uchar * k_bytes, uint row_byte_off, uint elem) {
+    const uint blk_byte_off = row_byte_off;
+    const float norm = triattn_read_f16(k_bytes, blk_byte_off);
+    const uint idx = (triattn_read_u8(k_bytes, blk_byte_off + 2u + elem / 4u) >> ((elem % 4u) * 2u)) & 0x3u;
+    return turbo_centroids_2bit[idx] * norm;
+}
+
+// block_turbo3_0 { half norm; uint8 qs[32]; uint8 signs[16]; } = 50 bytes.
+static inline float triattn_dequant_turbo3_0(device const uchar * k_bytes, uint row_byte_off, uint elem) {
+    const uint blk_byte_off = row_byte_off;
+    const float norm = triattn_read_f16(k_bytes, blk_byte_off);
+    const uint low2 = (triattn_read_u8(k_bytes, blk_byte_off + 2u + elem / 4u) >> ((elem % 4u) * 2u)) & 0x3u;
+    const uint hi1  = (triattn_read_u8(k_bytes, blk_byte_off + 2u + 32u + elem / 8u) >> (elem % 8u)) & 0x1u;
+    return turbo_centroids_3bit[low2 | (hi1 << 2u)] * norm;
+}
+
+// block_turbo4_0 { half norm; uint8 qs[64]; } = 66 bytes. Dequant stays in the
+// WHT-rotated domain by design (matches CUDA/Vulkan/CPU convention: need_wht_inv == false).
+static inline float triattn_dequant_turbo4_0(device const uchar * k_bytes, uint row_byte_off, uint elem) {
+    const uint blk_byte_off = row_byte_off;
+    const float norm = triattn_read_f16(k_bytes, blk_byte_off);
+    const uint idx = (triattn_read_u8(k_bytes, blk_byte_off + 2u + elem / 2u) >> ((elem % 2u) * 4u)) & 0xFu;
+    return turbo_centroids_4bit[idx] * norm;
+}
+
+static inline float triattn_dequant_elem(device const uchar * k_bytes, uint row_byte_off, uint elem, int k_type_id) {
+    if (k_type_id == TRIATTN_K_TYPE_F32)      return triattn_read_f32(k_bytes, row_byte_off + elem * 4u);
+    if (k_type_id == TRIATTN_K_TYPE_F16)      return triattn_read_f16(k_bytes, row_byte_off + elem * 2u);
+    if (k_type_id == TRIATTN_K_TYPE_Q8_0)     return triattn_dequant_q8_0(k_bytes, row_byte_off, elem);
+    if (k_type_id == TRIATTN_K_TYPE_TURBO2_0) return triattn_dequant_turbo2_0(k_bytes, row_byte_off, elem);
+    if (k_type_id == TRIATTN_K_TYPE_TURBO3_0) return triattn_dequant_turbo3_0(k_bytes, row_byte_off, elem);
+    return triattn_dequant_turbo4_0(k_bytes, row_byte_off, elem);
+}
+
+// Inverse WHT rotation over the 128-element threadgroup-shared k_smem, parallel across
+// threads 0..63 (2 elements/thread), mirroring the Vulkan .comp's inverse_wht_rotation_128().
+static inline void triattn_inverse_wht_128(threadgroup float * k_smem, uint tid) {
+    const float inv_sqrt_128 = 0.08838834764831845f;
+
+    k_smem[tid * 2u]      *= turbo_wht_signs2[tid * 2u];
+    k_smem[tid * 2u + 1u] *= turbo_wht_signs2[tid * 2u + 1u];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint h = 1u; h < 128u; h *= 2u) {
+        uint block_size = h * 2u;
+        uint i = (tid / h) * block_size + (tid % h);
+        if (i < 128u) {
+            float a = k_smem[i];
+            float b = k_smem[i + h];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            k_smem[i]     = a + b;
+            k_smem[i + h] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    k_smem[tid * 2u]      = k_smem[tid * 2u]      * inv_sqrt_128 * turbo_wht_signs1[tid * 2u];
+    k_smem[tid * 2u + 1u] = k_smem[tid * 2u + 1u] * inv_sqrt_128 * turbo_wht_signs1[tid * 2u + 1u];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void kernel_triattention_score(
+        constant ggml_metal_kargs_triattention_score & args [[buffer(0)]],
+        device const uchar  * k_bytes       [[buffer(1)]],
+        device const uint   * cell_indices  [[buffer(2)]],
+        device const int    * positions     [[buffer(3)]],
+        device const float  * omega         [[buffer(4)]],
+        device const float  * freq_scale_sq [[buffer(5)]],
+        device const float  * offsets       [[buffer(6)]],
+        device const float  * q_mean_real   [[buffer(7)]],
+        device const float  * q_mean_imag   [[buffer(8)]],
+        device const float  * q_mean_abs    [[buffer(9)]],
+        device const float  * extra_weight  [[buffer(10)]],
+        device       float  * scores_out    [[buffer(11)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]]) {
+    threadgroup float k_smem[256];
+    threadgroup float score_smem[128];
+
+    const uint cell_idx_local = tgpig;
+    const uint f = tiitg;
+
+    if (cell_idx_local >= args.n_cells || f >= args.freq_count) {
+        return;
+    }
+
+    const uint cell_global = cell_indices[cell_idx_local];
+    const uint row_byte_off = args.head_offset_bytes + cell_global * args.row_bytes;
+
+    // Step 1: dequant this thread's element pair into shared memory (natural order).
+    k_smem[f * 2u]      = triattn_dequant_elem(k_bytes, row_byte_off, f * 2u,      args.k_type_id);
+    k_smem[f * 2u + 1u] = triattn_dequant_elem(k_bytes, row_byte_off, f * 2u + 1u, args.k_type_id);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: inverse WHT rotation for turbo2/turbo3 (head_dim == 128 only).
+    if (args.need_wht_inv != 0 && args.padded_hd == 128u && f < 64u) {
+        triattn_inverse_wht_128(k_smem, f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: inverse RoPE (half layout: real = k_smem[f], imag = k_smem[f + freq_count]).
+    const int pos = positions[cell_idx_local];
+    const float w = omega[f];
+    const float theta = w * (float) pos;
+    const float cos_t = cos(theta);
+    const float sin_t = sin(theta);
+
+    float k_re = k_smem[f];
+    float k_im = k_smem[f + args.freq_count];
+    float pre_re =  k_re * cos_t + k_im * sin_t;
+    float pre_im = -k_re * sin_t + k_im * cos_t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    k_smem[f]                   = pre_re;
+    k_smem[f + args.freq_count] = pre_im;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: score
+    k_re = k_smem[f];
+    k_im = k_smem[f + args.freq_count];
+    const float k_mag = sqrt(k_re * k_re + k_im * k_im);
+
+    float total_score;
+    if (args.disable_trig == 0) {
+        const float base_delta = (float) (args.round_start - positions[cell_idx_local]);
+        const float amp = q_mean_abs[f] * k_mag;
+        const float fscale_sq = freq_scale_sq[f];
+        const float conj_re = q_mean_real[f] * k_re + q_mean_imag[f] * k_im;
+        const float conj_im = q_mean_imag[f] * k_re - q_mean_real[f] * k_im;
+        const float phi = atan2(conj_im, conj_re);
+        const float ew = extra_weight[f] * fscale_sq * k_mag;
+
+        if (args.agg_mode == 1u) {
+            float max_score = -1e30f;
+            for (uint d = 0u; d < args.n_offsets; d++) {
+                float delta = base_delta + offsets[d];
+                float phase = w * delta + phi;
+                max_score = max(max_score, amp * fscale_sq * cos(phase) + ew);
+            }
+            total_score = max_score;
+        } else {
+            float sum = 0.0f;
+            for (uint d = 0u; d < args.n_offsets; d++) {
+                float delta = base_delta + offsets[d];
+                float phase = w * delta + phi;
+                sum += amp * fscale_sq * cos(phase) + ew;
+            }
+            total_score = sum / (float) args.n_offsets;
+        }
+    } else {
+        total_score = extra_weight[f] * freq_scale_sq[f] * k_mag;
+    }
+
+    // Step 5: tree reduction across the freq_count threads of this threadgroup.
+    score_smem[f] = total_score;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = args.freq_count / 2u; stride > 0u; stride >>= 1u) {
+        if (f < stride) {
+            score_smem[f] += score_smem[f + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (f == 0u) {
+        scores_out[cell_idx_local] = score_smem[0];
+    }
+}
+
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
 constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
 constant short FC_solve_tri_k   [[function_constant(FC_SOLVE_TRI + 2)]];

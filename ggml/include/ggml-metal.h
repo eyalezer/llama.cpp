@@ -56,6 +56,71 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// ---- TriAttention GPU scoring (Metal) ----
+// Named triattention_mtl_* (not triattention_gpu_*) so this coexists with the
+// CUDA/Vulkan APIs in ggml-cuda.h/ggml-vulkan.h without symbol clashes in
+// combined-backend builds. Mirrors triattention_vk_* field-for-field; unlike
+// Vulkan, the Metal backend is a process-wide singleton, so there is no
+// device-index parameter.
+typedef struct triattention_mtl_state triattention_mtl_state;
+
+struct triattention_mtl_head_calib {
+    const float * q_mean_real;    // [freq_count]
+    const float * q_mean_imag;
+    const float * q_mean_abs;
+    const float * extra_weight;
+};
+
+struct triattention_mtl_config {
+    uint32_t head_dim;
+    uint32_t freq_count;
+    uint32_t n_kv_heads;
+    uint32_t n_sampled;
+    uint32_t n_offsets;
+    enum ggml_type k_type;
+    bool     need_wht_inv;
+    bool     disable_trig;
+};
+
+GGML_BACKEND_API triattention_mtl_state * triattention_mtl_init(
+    ggml_backend_t backend,
+    const struct triattention_mtl_config * config,
+    const struct triattention_mtl_head_calib * head_calibs,
+    const float * omega,
+    const float * freq_scale_sq,
+    const float * offsets);
+
+// Batched scoring, mirroring the CUDA/Vulkan "upload once, enqueue N kernels,
+// sync once" pattern:
+//   1. triattention_mtl_batch_begin() uploads the (shared) candidate cell
+//      indices/positions once and prepares a single command buffer.
+//   2. triattention_mtl_batch_enqueue_head() records one dispatch per sampled
+//      (layer, kv_head) into that same command buffer (no commit yet).
+//   3. triattention_mtl_batch_end() commits the whole batch, waits for
+//      completion, and reads all n_sampled*n_cells scores back in one copy.
+GGML_BACKEND_API void triattention_mtl_batch_begin(
+    triattention_mtl_state * state,
+    const uint32_t * cell_indices_host,
+    const int32_t  * positions_host,
+    uint32_t n_cells,
+    uint32_t n_total_scores);
+
+GGML_BACKEND_API void triattention_mtl_batch_enqueue_head(
+    triattention_mtl_state * state,
+    const struct ggml_tensor * k_tensor,
+    uint32_t kv_head_idx,
+    uint32_t head_calib_idx,
+    int64_t round_start,
+    int agg_mode,
+    uint32_t score_offset_elems);
+
+GGML_BACKEND_API void triattention_mtl_batch_end(
+    triattention_mtl_state * state,
+    float * scores_host_out,
+    uint32_t n_total_scores);
+
+GGML_BACKEND_API void triattention_mtl_free(triattention_mtl_state * state);
+
 #ifdef __cplusplus
 }
 #endif

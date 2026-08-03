@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -3968,6 +3971,34 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+static llama_kv_cache * resolve_kv_cache_for_triattention(llama_memory_t mem) {
+    if (!mem) {
+        return nullptr;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv) {
+        return kv;
+    }
+
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) {
+        return hybrid->get_mem_attn();
+    }
+
+    auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+    if (hybrid_iswa) {
+        return hybrid_iswa->get_mem_attn()->get_base();
+    }
+
+    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
+    if (kv_iswa) {
+        return kv_iswa->get_base();
+    }
+
+    return nullptr;
+}
+
 int32_t llama_triattention_init(
         struct llama_context * ctx,
                   const char * stats_path,
@@ -3982,7 +4013,10 @@ int32_t llama_triattention_init(
                         bool   protect_prefill,
                         bool   disable_mlr,
                         bool   disable_trig,
-                        bool   enable_logging) {
+                        bool   enable_logging,
+                     int32_t   rope_style,
+                     int32_t   prefix_cap,
+                        bool   prune_during_prefill) {
     if (!ctx || !stats_path || stats_path[0] == '\0') {
         return -1;
     }
@@ -3994,10 +4028,31 @@ int32_t llama_triattention_init(
         return -1;
     }
 
-    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    auto * kv = resolve_kv_cache_for_triattention(mem);
     if (!kv) {
         LLAMA_LOG_ERROR("%s: memory is not a KV cache (recurrent models not supported)\n", __func__);
         return -1;
+    }
+
+    // rope_style is no longer carried by the calibration file — resolve it from the
+    // model's own RoPE type unless the caller passed an explicit override (0 or 1).
+    uint32_t resolved_rope_style;
+    if (rope_style == 0 || rope_style == 1) {
+        resolved_rope_style = (uint32_t)rope_style;
+    } else {
+        const llama_rope_type rt = llama_model_rope_type(&ctx->get_model());
+        if (rt == LLAMA_ROPE_TYPE_NORM) {
+            resolved_rope_style = 1; // interleaved
+        } else if (rt == LLAMA_ROPE_TYPE_NEOX || rt == LLAMA_ROPE_TYPE_MROPE ||
+                   rt == LLAMA_ROPE_TYPE_IMROPE || rt == LLAMA_ROPE_TYPE_VISION) {
+            // All of these rotate dimension pairs in NEOX ("half") ordering;
+            // MROPE/IMROPE only differ in how multi-axis positions are combined.
+            resolved_rope_style = 0; // half
+        } else {
+            LLAMA_LOG_WARN("%s: could not auto-derive rope_style from model (rope_type=%d), defaulting to half\n",
+                    __func__, (int)rt);
+            resolved_rope_style = 0;
+        }
     }
 
     triattention_config cfg = {};
@@ -4010,12 +4065,31 @@ int32_t llama_triattention_init(
     cfg.seed             = seed;
     cfg.normalize_scores = normalize_scores;
     cfg.protect_prefill  = protect_prefill;
+    cfg.prefix_cap       = (uint32_t)(prefix_cap > 0 ? prefix_cap : 0);
     cfg.disable_mlr      = disable_mlr;
     cfg.disable_trig     = disable_trig;
     cfg.enable_logging   = enable_logging;
+    cfg.prune_during_prefill = prune_during_prefill;
 
-    kv->init_triattention(stats_path, &cfg);
+    kv->init_triattention(stats_path, &cfg, resolved_rope_style);
     return kv->has_triattention() ? 0 : -1;
+}
+
+void llama_triattention_protect_range(
+        struct llama_context * ctx,
+                     int64_t   pos_start,
+                     int64_t   pos_end) {
+    if (!ctx) {
+        return;
+    }
+
+    auto * mem = ctx->get_memory();
+    auto * kv = resolve_kv_cache_for_triattention(mem);
+    if (!kv) {
+        return;
+    }
+
+    kv->triattention_protect_range(pos_start, pos_end);
 }
 
 // llama state API

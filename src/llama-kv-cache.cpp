@@ -1104,7 +1104,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        // trial pass: cells/heads written here are unconditionally rolled back below,
+        // so TriAttention side effects must be skipped to avoid permanent desync/eviction
+        apply_ubatch(sinfo_new, ubatch, /*is_trial=*/true);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1446,7 +1448,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool is_trial) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1486,12 +1488,16 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
-                triattention_on_cell_removed(triattention_st, idx);
+                if (!is_trial) {
+                    triattention_on_cell_removed(triattention_st, idx);
+                }
                 cells.rm(idx);
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
-            triattention_on_token_added(triattention_st, idx, ubatch.pos[i]);
+            if (!is_trial) {
+                triattention_on_token_added(triattention_st, idx, ubatch.pos[i]);
+            }
 
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
@@ -1536,18 +1542,29 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     // TriAttention: set prefix length and check if pruning should trigger
-    if (triattention_st != nullptr) {
-        // Set prefix_length once on the first prompt batch (contains position 0, >1 token).
-        // This enables prefix protection during pruning so prompt tokens are never evicted.
-        if (triattention_st->prefix_length == 0 && ubatch.n_tokens > 1) {
-            bool has_pos_zero = false;
+    // Skipped entirely during prepare()'s speculative trial pass (is_trial=true), since
+    // that pass's cell/head writes get unconditionally rolled back afterward, but these
+    // side effects (bookkeeping + real eviction via try_prune) are not part of that rollback.
+    if (triattention_st != nullptr && !is_trial) {
+        // Extend prefix_length over every prefill ubatch (n_tokens > 1) so the whole
+        // initial prompt is protected, not just its first n_ubatch-sized chunk; a
+        // decode ubatch (n_tokens == 1) means prefill is over, so stop extending it.
+        // Capped (default: budget/2) so a single huge prompt can't consume the whole
+        // eviction budget and disable pruning for the rest of prefill.
+        if (ubatch.n_tokens > 1) {
             llama_pos max_batch_pos = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                if (ubatch.pos[i] == 0) has_pos_zero = true;
                 if (ubatch.pos[i] > max_batch_pos) max_batch_pos = ubatch.pos[i];
             }
-            if (has_pos_zero) {
-                triattention_st->prefix_length = max_batch_pos + 1;
+            const llama_pos prefix_cap = triattention_st->cfg.prefix_cap > 0
+                ? (llama_pos) triattention_st->cfg.prefix_cap
+                : (llama_pos) (triattention_st->cfg.budget / 2);
+            llama_pos new_prefix_length = max_batch_pos + 1;
+            if (new_prefix_length > prefix_cap) {
+                new_prefix_length = prefix_cap;
+            }
+            if (new_prefix_length > triattention_st->prefix_length) {
+                triattention_st->prefix_length = new_prefix_length;
             }
         }
 
@@ -1558,7 +1575,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 n_used++;
             }
         }
-        if (triattention_should_prune(triattention_st, n_used)) {
+        // Skip the trigger on prefill ubatches when prune_during_prefill is disabled,
+        // deferring all eviction until decode (n_tokens == 1).
+        const bool can_prune_here = ubatch.n_tokens == 1 || triattention_st->cfg.prune_during_prefill;
+        if (can_prune_here && triattention_should_prune(triattention_st, n_used)) {
             triattention_try_prune();
         }
     }
@@ -3101,7 +3121,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache: TriAttention integration
 //
 
-void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg) {
+void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg, uint32_t rope_style) {
     if (!stats_path || stats_path[0] == '\0') {
         return;
     }
@@ -3113,9 +3133,10 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
     const uint32_t kv_size = v_cells.empty() ? 0 : (uint32_t)v_cells[0].size();
     const double rope_theta = (double)hparams.rope_freq_base_train;
     const uint32_t head_dim = hparams.n_embd_head_k(0);
+    const uint32_t rot_dim = hparams.n_rot(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
 
-    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads);
+    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, rot_dim, n_kv_heads, rope_style);
     if (!triattention_st) {
         LLAMA_LOG_ERROR("%s: failed to initialize TriAttention from %s\n", __func__, stats_path);
     }
@@ -3179,6 +3200,13 @@ int32_t llama_kv_cache::triattention_try_prune() {
 
 bool llama_kv_cache::has_triattention() const {
     return triattention_st != nullptr;
+}
+
+void llama_kv_cache::triattention_protect_range(int64_t pos_start, int64_t pos_end) {
+    if (!triattention_st) {
+        return;
+    }
+    ::triattention_protect_range(triattention_st, pos_start, pos_end);
 }
 
 //

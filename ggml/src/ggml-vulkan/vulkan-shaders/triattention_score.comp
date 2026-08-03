@@ -1,0 +1,254 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+// TriAttention scoring kernel (Vulkan port of ggml/src/ggml-cuda/triattention-score.cu).
+// One workgroup scores one cached position; local_size_x == freq_count (spec constant 0).
+// K_TYPE_ID (spec constant 1) selects the dequant path at pipeline-creation time.
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint FREQ_COUNT   = 64;
+layout (constant_id = 1) const uint K_TYPE_ID     = 0;   // 0=F32 1=F16 2=Q8_0 3=TURBO2_0 4=TURBO3_0 5=TURBO4_0
+layout (constant_id = 2) const uint NEED_WHT_INV  = 0;
+
+#define K_TYPE_F32      0
+#define K_TYPE_F16      1
+#define K_TYPE_Q8_0     2
+#define K_TYPE_TURBO2_0 3
+#define K_TYPE_TURBO3_0 4
+#define K_TYPE_TURBO4_0 5
+
+layout (push_constant) uniform PC {
+    uint row_bytes;
+    uint head_offset_bytes;
+    uint padded_hd;
+    uint n_cells;
+    int  round_start;
+    uint n_offsets;
+    uint agg_mode;      // 0 = mean, 1 = max
+    uint disable_trig;  // 0/1
+} pc;
+
+layout (binding = 0) readonly buffer KBuf          { uint8_t k_bytes[]; };
+layout (binding = 1) readonly buffer CellIdxBuf     { uint    cell_indices[]; };
+layout (binding = 2) readonly buffer PosBuf         { int     positions[]; };
+layout (binding = 3) readonly buffer OmegaBuf       { float   omega[]; };
+layout (binding = 4) readonly buffer FreqScaleSqBuf { float   freq_scale_sq[]; };
+layout (binding = 5) readonly buffer OffsetsBuf     { float   offsets[]; };
+layout (binding = 6) readonly buffer QMeanRealBuf   { float   q_mean_real[]; };
+layout (binding = 7) readonly buffer QMeanImagBuf   { float   q_mean_imag[]; };
+layout (binding = 8) readonly buffer QMeanAbsBuf    { float   q_mean_abs[]; };
+layout (binding = 9) readonly buffer ExtraWeightBuf { float   extra_weight[]; };
+layout (binding = 10) writeonly buffer ScoresBuf    { float   scores_out[]; };
+
+shared float k_smem[256];      // dequantized K, natural element order
+shared float score_smem[128];  // per-thread partial scores for the reduction
+
+uint read_u8(uint byte_off) {
+    return uint(k_bytes[byte_off]);
+}
+
+float read_f32(uint byte_off) {
+    uint b0 = read_u8(byte_off), b1 = read_u8(byte_off + 1), b2 = read_u8(byte_off + 2), b3 = read_u8(byte_off + 3);
+    return uintBitsToFloat(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+float read_f16(uint byte_off) {
+    uint lo = read_u8(byte_off), hi = read_u8(byte_off + 1);
+    return unpackHalf2x16(lo | (hi << 8)).x;
+}
+
+// Q8_0: block of 32 elements, layout { float16 d; int8 qs[32]; }, block size = 34 bytes.
+float dequant_q8_0(uint row_byte_off, uint elem) {
+    const uint blk = elem / 32u;
+    const uint off = elem % 32u;
+    const uint blk_byte_off = row_byte_off + blk * 34u;
+    const float d = read_f16(blk_byte_off);
+    const int q = int(int8_t(read_u8(blk_byte_off + 2u + off)));
+    return float(q) * d;
+}
+
+// TurboQuant centroid tables (from vulkan-shaders/dequant_funcs.glsl), block size 128.
+float dequant_turbo2_0(uint row_byte_off, uint elem) {
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    // block_turbo2_0 { float16 norm; uint8 qs[32]; } = 34 bytes, 128 elems/block
+    const uint blk_byte_off = row_byte_off; // padded_hd == 128 assumed (single block)
+    const float norm = read_f16(blk_byte_off);
+    const uint idx = (read_u8(blk_byte_off + 2u + elem / 4u) >> ((elem % 4u) * 2u)) & 0x3u;
+    return centroids[idx] * norm;
+}
+
+float dequant_turbo3_0(uint row_byte_off, uint elem) {
+    const float centroids[8] = float[8](
+        -0.190685, -0.117832, -0.065717, -0.021460,
+         0.021460,  0.065717,  0.117832,  0.190685
+    );
+    // block_turbo3_0 { float16 norm; uint8 qs[32]; uint8 signs[16]; } = 50 bytes
+    const uint blk_byte_off = row_byte_off;
+    const float norm = read_f16(blk_byte_off);
+    const uint low2 = (read_u8(blk_byte_off + 2u + elem / 4u) >> ((elem % 4u) * 2u)) & 0x3u;
+    const uint hi1  = (read_u8(blk_byte_off + 2u + 32u + elem / 8u) >> (elem % 8u)) & 0x1u;
+    return centroids[low2 | (hi1 << 2u)] * norm;
+}
+
+float dequant_turbo4_0(uint row_byte_off, uint elem) {
+    const float centroids[16] = float[16](
+        -0.241529, -0.182877, -0.143016, -0.111036,
+        -0.083292, -0.058050, -0.034299, -0.011349,
+         0.011349,  0.034299,  0.058050,  0.083292,
+         0.111036,  0.143016,  0.182877,  0.241529
+    );
+    // block_turbo4_0 { float16 norm; uint8 qs[64]; } = 66 bytes
+    const uint blk_byte_off = row_byte_off;
+    const float norm = read_f16(blk_byte_off);
+    const uint idx = (read_u8(blk_byte_off + 2u + elem / 2u) >> ((elem % 2u) * 4u)) & 0xFu;
+    return centroids[idx] * norm;
+}
+
+float dequant_elem(uint row_byte_off, uint elem) {
+    if (K_TYPE_ID == K_TYPE_F32)      return read_f32(row_byte_off + elem * 4u);
+    if (K_TYPE_ID == K_TYPE_F16)      return read_f16(row_byte_off + elem * 2u);
+    if (K_TYPE_ID == K_TYPE_Q8_0)     return dequant_q8_0(row_byte_off, elem);
+    if (K_TYPE_ID == K_TYPE_TURBO2_0) return dequant_turbo2_0(row_byte_off, elem);
+    if (K_TYPE_ID == K_TYPE_TURBO3_0) return dequant_turbo3_0(row_byte_off, elem);
+    return dequant_turbo4_0(row_byte_off, elem);
+}
+
+// Inverse Walsh-Hadamard rotation sign tables (from vulkan-shaders/turbo_wht.comp),
+// applied as: x *= S2; x = FWHT(x); x *= S1  (the inverse of the forward S1->FWHT->S2 rotation).
+const float WHT_S1[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+const float WHT_S2[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+const float INV_SQRT_128 = 0.08838834764831845;
+
+void inverse_wht_rotation_128(uint tid) {
+    // Signs2 pre-multiply (2 elements per thread, tid in [0,64))
+    k_smem[tid * 2u]      *= WHT_S2[tid * 2u];
+    k_smem[tid * 2u + 1u] *= WHT_S2[tid * 2u + 1u];
+    barrier();
+
+    for (uint h = 1u; h < 128u; h *= 2u) {
+        uint block_size = h * 2u;
+        uint i = (tid / h) * block_size + (tid % h);
+        if (i < 128u) {
+            float a = k_smem[i];
+            float b = k_smem[i + h];
+            barrier();
+            k_smem[i]     = a + b;
+            k_smem[i + h] = a - b;
+        }
+        barrier();
+    }
+
+    k_smem[tid * 2u]      = k_smem[tid * 2u]      * INV_SQRT_128 * WHT_S1[tid * 2u];
+    k_smem[tid * 2u + 1u] = k_smem[tid * 2u + 1u] * INV_SQRT_128 * WHT_S1[tid * 2u + 1u];
+    barrier();
+}
+
+void main() {
+    const uint cell_idx_local = gl_WorkGroupID.x;
+    const uint f = gl_LocalInvocationID.x;
+
+    if (cell_idx_local >= pc.n_cells || f >= FREQ_COUNT) {
+        return;
+    }
+
+    const uint cell_global = cell_indices[cell_idx_local];
+    const uint row_byte_off = pc.head_offset_bytes + cell_global * pc.row_bytes;
+
+    // Step 1: dequant this thread's element pair into shared memory (natural order).
+    k_smem[f * 2u]      = dequant_elem(row_byte_off, f * 2u);
+    k_smem[f * 2u + 1u] = dequant_elem(row_byte_off, f * 2u + 1u);
+    barrier();
+
+    // Step 2: inverse WHT rotation for turbo2/turbo3 (head_dim == 128 only).
+    if (NEED_WHT_INV != 0u && pc.padded_hd == 128u && f < 64u) {
+        inverse_wht_rotation_128(f);
+    }
+    barrier();
+
+    // Step 3: inverse RoPE (half layout: real = k_smem[f], imag = k_smem[f + FREQ_COUNT]).
+    const int pos = positions[cell_idx_local];
+    const float w = omega[f];
+    const float theta = w * float(pos);
+    const float cos_t = cos(theta);
+    const float sin_t = sin(theta);
+
+    float k_re = k_smem[f];
+    float k_im = k_smem[f + FREQ_COUNT];
+    float pre_re =  k_re * cos_t + k_im * sin_t;
+    float pre_im = -k_re * sin_t + k_im * cos_t;
+    barrier();
+    k_smem[f]              = pre_re;
+    k_smem[f + FREQ_COUNT] = pre_im;
+    barrier();
+
+    // Step 4: score
+    k_re = k_smem[f];
+    k_im = k_smem[f + FREQ_COUNT];
+    const float k_mag = sqrt(k_re * k_re + k_im * k_im);
+
+    float total_score;
+    if (pc.disable_trig == 0u) {
+        const float base_delta = float(pc.round_start - positions[cell_idx_local]);
+        const float amp = q_mean_abs[f] * k_mag;
+        const float fscale_sq = freq_scale_sq[f];
+        const float conj_re = q_mean_real[f] * k_re + q_mean_imag[f] * k_im;
+        const float conj_im = q_mean_imag[f] * k_re - q_mean_real[f] * k_im;
+        const float phi = atan(conj_im, conj_re);
+        const float ew = extra_weight[f] * fscale_sq * k_mag;
+
+        if (pc.agg_mode == 1u) {
+            float max_score = -1e30;
+            for (uint d = 0u; d < pc.n_offsets; d++) {
+                float delta = base_delta + offsets[d];
+                float phase = w * delta + phi;
+                max_score = max(max_score, amp * fscale_sq * cos(phase) + ew);
+            }
+            total_score = max_score;
+        } else {
+            float sum = 0.0;
+            for (uint d = 0u; d < pc.n_offsets; d++) {
+                float delta = base_delta + offsets[d];
+                float phase = w * delta + phi;
+                sum += amp * fscale_sq * cos(phase) + ew;
+            }
+            total_score = sum / float(pc.n_offsets);
+        }
+    } else {
+        total_score = extra_weight[f] * freq_scale_sq[f] * k_mag;
+    }
+
+    // Step 5: tree reduction across the FREQ_COUNT threads of this workgroup.
+    score_smem[f] = total_score;
+    barrier();
+    for (uint stride = FREQ_COUNT / 2u; stride > 0u; stride >>= 1u) {
+        if (f < stride) {
+            score_smem[f] += score_smem[f + stride];
+        }
+        barrier();
+    }
+
+    if (f == 0u) {
+        scores_out[cell_idx_local] = score_smem[0];
+    }
+}
