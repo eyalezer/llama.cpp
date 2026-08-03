@@ -156,6 +156,8 @@ struct triattention_config {
     bool disable_mlr;             // Ablation: use q_abs_mean directly as extra_weight (default: false)
     bool disable_trig;            // Ablation: drop trigonometric term, norm-only scoring (default: false)
     bool enable_logging;          // Log pruning events to stderr (default: false)
+    bool prune_during_prefill;    // Allow the prune trigger to fire on prefill ubatches (n_tokens > 1),
+                                   // not just decode; disabling defers all eviction until decode (default: true)
 
     int32_t seed;                 // RNG seed for tie-breaking noise (-1 = disabled, default: 0)
 };

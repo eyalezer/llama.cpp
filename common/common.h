@@ -762,6 +762,7 @@ struct common_params {
     bool        triattention_disable_mlr  = false;  // ablation: disable MLR weighting
     bool        triattention_disable_trig = false;  // ablation: norm-only scoring
     bool        triattention_log          = false;  // log pruning events to stderr
+    bool        triattention_prune_prefill = true;  // allow eviction during prefill, not just decode
     int32_t     triattention_rope_style   = -1;    // -1=auto (from model), 0=half, 1=interleaved
     std::string triattention_protect_roles = "system,tool"; // comma list of chat roles whose
                                                             // message spans are never evicted

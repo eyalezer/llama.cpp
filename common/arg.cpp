@@ -4706,6 +4706,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--triattention-no-prune-prefill"},
+        "defer all eviction until decode, never prune during prefill (default: prune during prefill too)",
+        [](common_params & params) {
+            params.triattention_prune_prefill = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--triattention-protect-roles"}, "ROLES",
         string_format("comma list of chat roles (system,user,assistant,tool) whose message\n"
                       "spans are never evicted by TriAttention, empty to disable (default: %s)",

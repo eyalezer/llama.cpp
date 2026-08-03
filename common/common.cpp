@@ -1338,7 +1338,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.triattention_disable_trig,
             params.triattention_log,
             params.triattention_rope_style,
-            params.triattention_prefix_cap);
+            params.triattention_prefix_cap,
+            params.triattention_prune_prefill);
         if (rc != 0) {
             LOG_WRN("%s: TriAttention initialization failed (stats=%s) — continuing without eviction\n",
                     __func__, params.triattention_stats.c_str());

@@ -4015,7 +4015,8 @@ int32_t llama_triattention_init(
                         bool   disable_trig,
                         bool   enable_logging,
                      int32_t   rope_style,
-                     int32_t   prefix_cap) {
+                     int32_t   prefix_cap,
+                        bool   prune_during_prefill) {
     if (!ctx || !stats_path || stats_path[0] == '\0') {
         return -1;
     }
@@ -4068,6 +4069,7 @@ int32_t llama_triattention_init(
     cfg.disable_mlr      = disable_mlr;
     cfg.disable_trig     = disable_trig;
     cfg.enable_logging   = enable_logging;
+    cfg.prune_during_prefill = prune_during_prefill;
 
     kv->init_triattention(stats_path, &cfg, resolved_rope_style);
     return kv->has_triattention() ? 0 : -1;

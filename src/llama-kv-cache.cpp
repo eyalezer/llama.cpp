@@ -1575,7 +1575,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 n_used++;
             }
         }
-        if (triattention_should_prune(triattention_st, n_used)) {
+        // Skip the trigger on prefill ubatches when prune_during_prefill is disabled,
+        // deferring all eviction until decode (n_tokens == 1).
+        const bool can_prune_here = ubatch.n_tokens == 1 || triattention_st->cfg.prune_during_prefill;
+        if (can_prune_here && triattention_should_prune(triattention_st, n_used)) {
             triattention_try_prune();
         }
     }
