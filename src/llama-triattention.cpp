@@ -683,6 +683,7 @@ triattention_state * triattention_init(
     state->kv_size = kv_size;
     state->head_dim = head_dim;
     state->absolute_position = 0;
+    state->last_prune_position = 0;
     state->prefix_length     = 0;
 
     const uint32_t fc = cal->freq_count;
@@ -831,6 +832,7 @@ void triattention_on_position_shift(
 void triattention_on_reset(triattention_state * state) {
     if (!state) return;
     state->absolute_position = 0;
+    state->last_prune_position = 0;
     state->prefix_length     = 0;
     for (uint32_t i = 0; i < state->kv_size; i++) {
         state->cell_positions[i] = -1;
@@ -849,9 +851,13 @@ bool triattention_should_prune(
 
     switch (state->cfg.trigger) {
         case TRIATTENTION_TRIGGER_INTERVAL:
+            // Track elapsed tokens since the last *successful* prune rather than
+            // requiring absolute_position to land exactly on a divide_length multiple.
+            // A skipped/delayed prune call (e.g. due to a decode stall) used to permanently
+            // desync the modulo check, stalling pruning until n_used grew far past budget.
             return n_used >= state->cfg.budget &&
                    state->absolute_position > 0 &&
-                   (state->absolute_position % state->cfg.divide_length) == 0;
+                   (state->absolute_position - state->last_prune_position) >= (int64_t)state->cfg.divide_length;
 
         case TRIATTENTION_TRIGGER_SLACK:
             return n_used >= (state->cfg.budget + state->cfg.divide_length);
@@ -1631,6 +1637,7 @@ int32_t triattention_prune_impl(
     state->total_tokens_evicted += n_evicted;
     state->last_prune_time_ms = t_end - t_start;
     state->total_prune_time_ms += state->last_prune_time_ms;
+    state->last_prune_position = state->absolute_position;
 
     if (cfg.enable_logging) {
         fprintf(stderr, "[TriAttention] Pruned: %u → %u tokens (%u evicted, %u protected [prefix=%lld, recent=%d]), "

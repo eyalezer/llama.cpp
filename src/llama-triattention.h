@@ -167,6 +167,7 @@ struct triattention_state {
 
     // Inference tracking
     int64_t  absolute_position;   // Monotonically increasing token counter
+    int64_t  last_prune_position; // absolute_position as of the last successful prune (INTERVAL trigger)
     int64_t  prefix_length;       // Prompt length (protected if protect_prefill)
     uint32_t kv_size;             // Total KV cache capacity (from cache init)
     uint32_t head_dim;            // Full per-head K embedding dim (buffer stride) —
