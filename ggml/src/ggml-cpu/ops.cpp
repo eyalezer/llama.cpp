@@ -13,7 +13,7 @@
 #include <cmath>
 
 extern "C" {
-GGML_API int turbo3_cpu_wht_group_size;
+GGML_API int turbo_cpu_wht_group_size;
 }
 
 // ggml_compute_forward_dup
@@ -5138,7 +5138,7 @@ static void ggml_compute_forward_set_rows_impl(
     if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+        turbo_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
     }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
