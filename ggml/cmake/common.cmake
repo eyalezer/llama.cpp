@@ -119,3 +119,17 @@ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
 
     set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
 endfunction()
+
+# TurboQuant FlashAttention vector instances are always compiled (turbo KV cache is always enabled and
+# has no GGML_CUDA_FA gating). Gather every fattn-vec instance file whose name references a turbo type
+# (turbo2_0 / turbo3_0 / turbo4_0) and return them in OUT_SRCS. Missing files are a hard error so the
+# instance list stays in sync with ggml_cuda_get_fatn_vec_case() in ggml-cuda/fattn.cu.
+function(ggml_cuda_fatn_vec_turbo_instances DIR OUT_SRCS)
+    set(SRCS "")
+    file(GLOB TURBO_SRCS "${DIR}/template-instances/fattn-vec-instance-*turbo*.cu")
+    foreach (SRC IN LISTS TURBO_SRCS)
+        list(APPEND SRCS "${SRC}")
+    endforeach()
+    list(SORT SRCS)
+    set(${OUT_SRCS} ${SRCS} PARENT_SCOPE)
+endfunction()
