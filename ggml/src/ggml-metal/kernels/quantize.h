@@ -260,3 +260,107 @@ void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
         src += 4*32;
     }
 }
+
+
+// ===== TurboQuant quantize =====
+void quantize_turbo2_0(device const float * src, device block_turbo2_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO2; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    for (int j = 0; j < QK_TURBO2 / 4; j++) dst.qs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO2; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_2bit[0]) idx = 0;
+        else if (val < turbo_mid_2bit[1]) idx = 1;
+        else if (val < turbo_mid_2bit[2]) idx = 2;
+        else                              idx = 3;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+    }
+}
+
+// Quantize 32 elements into one block_turbo3_0 (NO rotation — rotation happens
+// at the 128-element group level in kernel_set_rows_turbo)
+void quantize_turbo3_0(device const float * src, device block_turbo3_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // Compute norm for this 32-element sub-block
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO3; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    // Quantize to 3-bit centroids
+    for (int j = 0; j < QK_TURBO3 / 4; j++) dst.qs[j] = 0;
+    for (int j = 0; j < QK_TURBO3 / 8; j++) dst.signs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_3bit[0]) idx = 0;
+        else if (val < turbo_mid_3bit[1]) idx = 1;
+        else if (val < turbo_mid_3bit[2]) idx = 2;
+        else if (val < turbo_mid_3bit[3]) idx = 3;
+        else if (val < turbo_mid_3bit[4]) idx = 4;
+        else if (val < turbo_mid_3bit[5]) idx = 5;
+        else if (val < turbo_mid_3bit[6]) idx = 6;
+        else                              idx = 7;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+        if (idx & 0x4) {
+            dst.signs[j / 8] |= (1 << (j % 8));
+        }
+    }
+}
+
+void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // 4-bit PolarQuant: normalize → rotate → quantize to 16 centroids → nibble pack
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float grp_norm = sqrt(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
+
+    for (int j = 0; j < QK_TURBO4 / 2; j++) dst.qs[j] = 0;
+
+    float recon_norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        float val = x[j];
+        uint8_t idx;
+        if      (val < turbo_mid_4bit[ 0]) idx = 0;
+        else if (val < turbo_mid_4bit[ 1]) idx = 1;
+        else if (val < turbo_mid_4bit[ 2]) idx = 2;
+        else if (val < turbo_mid_4bit[ 3]) idx = 3;
+        else if (val < turbo_mid_4bit[ 4]) idx = 4;
+        else if (val < turbo_mid_4bit[ 5]) idx = 5;
+        else if (val < turbo_mid_4bit[ 6]) idx = 6;
+        else if (val < turbo_mid_4bit[ 7]) idx = 7;
+        else if (val < turbo_mid_4bit[ 8]) idx = 8;
+        else if (val < turbo_mid_4bit[ 9]) idx = 9;
+        else if (val < turbo_mid_4bit[10]) idx = 10;
+        else if (val < turbo_mid_4bit[11]) idx = 11;
+        else if (val < turbo_mid_4bit[12]) idx = 12;
+        else if (val < turbo_mid_4bit[13]) idx = 13;
+        else if (val < turbo_mid_4bit[14]) idx = 14;
+        else                               idx = 15;
+
+        dst.qs[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
+        recon_norm_sq += turbo_centroids_4bit[idx] * turbo_centroids_4bit[idx];
+    }
+
+    float recon_norm = sqrt(recon_norm_sq);
+    dst.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
+}
+
+// ----- turbo3 dequantize with per-thread block cache -----
+// ===== END TurboQuant quantize =====
