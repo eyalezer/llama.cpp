@@ -1018,6 +1018,8 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
+    vk_pipeline pipeline_turbo_wht;
+
     ~vk_device_struct();
 
 };
