@@ -62,6 +62,8 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+# Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
+list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -72,6 +74,10 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
 ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+# TurboQuant FlashAttention vector instances: always compiled, no GGML_CUDA_FA gating.
+ggml_cuda_fatn_vec_turbo_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda TURBO_SRCS)
+list(APPEND GGML_SOURCES_ROCM ${TURBO_SRCS})
 
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
