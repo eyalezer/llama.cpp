@@ -112,8 +112,12 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
+    ggml_cuda_fatn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+    # TurboQuant FlashAttention vector instances: always compiled, no GGML_CUDA_FA gating.
+    ggml_cuda_fatn_vec_turbo_instances(${CMAKE_CURRENT_SOURCE_DIR} TURBO_SRCS)
+    list(APPEND GGML_SOURCES_CUDA ${TURBO_SRCS})
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
@@ -196,7 +200,8 @@ if (CUDAToolkit_FOUND)
         # - speed (nvcc's default)
         # - balance
         # - size
-        list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+        # Disabled: -compress-mode causes issues with GCC 12 host compiler
+        # list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
     endif()
 
     if (GGML_FATAL_WARNINGS)
