@@ -98,7 +98,7 @@ extern int g_ggml_sycl_memtrace_step;
 
 // define for XMX in Intel GPU
 // TODO: currently, it's not used for XMX really.
-#if !defined(GGML_SYCL_FORCE_MMQ)
+#if !defined(GGML_SYCL_FORCE_MMQ) && !defined(GGML_SYCL_SCALAR_MMQ)
     #define SYCL_USE_XMX
 #endif
 

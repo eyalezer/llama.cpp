@@ -1,8 +1,14 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #include "types.glsl"
 
-#if defined(SET_ROWS) && QUANT_K == 1
+#if defined(SET_ROWS) && (defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO4_0))
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+const uint BLOCK_SIZE = 128;
+#elif defined(SET_ROWS) && QUANT_K == 1
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 const uint BLOCK_SIZE = 512;
 #else
@@ -238,6 +244,118 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO4_0)
+const float TS1[128] = float[128](
+    -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
+    -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1,
+    -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,  1, -1,
+    -1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1,  1
+);
+
+const float TS2[128] = float[128](
+     1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,
+    -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
+);
+
+const float TINV = 0.08838834764831845;  // 1 / sqrt(128)
+
+// TurboQuant 2-bit centroids
+const float T2M[3] = float[3](-0.086728, 0.0, 0.086728);
+
+const float TC[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+
+const float TM[7] = float[7](
+    -0.154259, -0.091775, -0.043589,
+     0.0,
+     0.043589,  0.091775,  0.154259
+);
+
+// TurboQuant 4-bit midpoints
+const float T4M[15] = float[15](
+    -0.212203, -0.162947, -0.127026, -0.097164,
+    -0.070671, -0.046174, -0.022824,  0.000000,
+     0.022824,  0.046174,  0.070671,  0.097164,
+     0.127026,  0.162947,  0.212203
+);
+
+#if defined(SET_ROWS)
+
+shared float wht[128];
+shared float sg_acc[16];
+shared float gnrm;
+
+#endif // defined(SET_ROWS)
+#endif // defined(DATA_A_TURBO3_0) ...
+
+#if defined(DATA_A_TQ3_1S) || defined(DATA_A_TQ4_1S)
+
+const float TQ_SIGNS[32] = float[32](
+    +1, -1, +1, -1, +1, +1, -1, +1,
+    -1, -1, +1, -1, +1, +1, -1, +1,
+    -1, -1, +1, -1, +1, -1, -1, +1,
+    -1, +1, +1, -1, +1, -1, -1, +1
+);
+
+const float TQ_INV_SQRT32 = 0.17677669529663688;  // 1 / sqrt(32)
+
+const float TQ3_CENTROIDS[8] = float[8](
+    -1.996684, -1.291398, -0.740341, -0.247508,
+     0.230106,  0.725222,  1.277503,  1.988943
+);
+
+uint tq3_choose_index(float val) {
+    if (val < -1.644041) return 0u;
+    if (val < -1.015869) return 1u;
+    if (val < -0.493925) return 2u;
+    if (val < -0.008701) return 3u;
+    if (val <  0.477664) return 4u;
+    if (val <  1.001362) return 5u;
+    if (val <  1.633223) return 6u;
+    return 7u;
+}
+
+const float TQ4_CENTROIDS[16] = float[16](
+    -2.732590, -2.069017, -1.618046, -1.256231,
+    -0.942340, -0.656759, -0.388048, -0.128395,
+     0.128395,  0.388048,  0.656759,  0.942340,
+     1.256231,  1.618046,  2.069017,  2.732590
+);
+
+// Midpoint thresholds for nearest-centroid binary search (16 centroids)
+uint tq4_choose_index(float val) {
+    if (val < -2.400804) return 0u;
+    if (val < -1.843532) return 1u;
+    if (val < -1.437139) return 2u;
+    if (val < -1.099286) return 3u;
+    if (val < -0.799550) return 4u;
+    if (val < -0.522404) return 5u;
+    if (val < -0.258222) return 6u;
+    if (val <  0.000000) return 7u;
+    if (val <  0.258222) return 8u;
+    if (val <  0.522404) return 9u;
+    if (val <  0.799550) return 10u;
+    if (val <  1.099286) return 11u;
+    if (val <  1.437139) return 12u;
+    if (val <  1.843532) return 13u;
+    if (val <  2.400804) return 14u;
+    return 15u;
+}
+
+#endif // defined(DATA_A_TQ4_1S) ...
+
 #if defined(DATA_A_IQ4_NL)
 uint best_index(float x) {
     if (x <= kvalues_iq4nl[0]) return 0;
@@ -300,7 +418,329 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
-#if defined(SET_ROWS)
+#if defined(SET_ROWS) && (defined(DATA_A_TURBO3_0) || defined(DATA_A_TURBO2_0) || defined(DATA_A_TURBO4_0))
+void main() {
+    const uint t   = gl_LocalInvocationID.x;
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 128;
+
+    if (gpr == 0) return;
+    if (g >= p.ne / 128) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne12;
+    const uint i03 = tmp / p.ne12;
+
+    const uint sb  = src0_idx(ig * 128, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    float val = data_s[sb + t];
+
+    // Step 2: L2 norm via subgroup reduction
+    float v2 = val * val;
+    v2 = subgroupAdd(v2);
+    if (gl_SubgroupInvocationID == 0) sg_acc[gl_SubgroupID] = v2;
+    barrier();
+    if (t == 0) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc[w];
+        gnrm = sqrt(total);
+    }
+    barrier();
+
+    // Step 3: normalize, then apply forward WHT
+    val *= (gnrm > 1e-10) ? (1.0 / gnrm) : 0.0;
+    val *= TS1[t];
+
+    // Optimized WHT using subgroup shuffle
+    uint sg_size = gl_SubgroupSize;
+    for (uint h = 1; h < sg_size && h < 128; h *= 2) {
+        float other = subgroupShuffleXor(val, h);
+        val = ((t & h) == 0) ? (val + other) : (other - val);
+    }
+
+    if (sg_size < 128) {
+        wht[t] = val;
+        barrier();
+        for (uint h = sg_size; h < 128; h *= 2) {
+            if ((t % (2 * h)) < h) {
+                float a = wht[t];
+                float b = wht[t + h];
+                wht[t]     = a + b;
+                wht[t + h] = a - b;
+            }
+            barrier();
+        }
+        val = wht[t];
+    }
+
+    // Step 5: apply signs2 + scaling
+    val *= TINV * TS2[t];
+
+    // Step 6: Quantize
+#if defined(DATA_A_TURBO2_0)
+    uint idx = val < T2M[0] ? 0u : val < T2M[1] ? 1u : val < T2M[2] ? 2u : 3u;
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint my_2bit = idx & 0x3u;
+    uint qs_byte = 0u;
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        uint contrib = subgroupShuffle(my_2bit, (sg_lane & ~3u) + k);
+        qs_byte |= contrib << (k * 2u);
+    }
+    if (sg_lane % 4u == 0u) {
+        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
+    }
+#elif defined(DATA_A_TURBO3_0)
+    uint idx = val < TM[0] ? 0u : val < TM[1] ? 1u : val < TM[2] ? 2u : val < TM[3] ? 3u :
+              val < TM[4] ? 4u : val < TM[5] ? 5u : val < TM[6] ? 6u : 7u;
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint my_low2 = idx & 0x3u;
+    uint qs_byte = 0u;
+    [[unroll]] for (uint k = 0; k < 4; k++) {
+        uint contrib = subgroupShuffle(my_low2, (sg_lane & ~3u) + k);
+        qs_byte |= contrib << (k * 2u);
+    }
+    if (sg_lane % 4u == 0u) {
+        data_q[db].qs[t / 4u] = uint8_t(qs_byte);
+    }
+    uvec4 ballot = subgroupBallot(((idx >> 2u) & 1u) != 0u);
+    if (sg_lane % 8u == 0u) {
+        uint local_byte = sg_lane / 8u;
+        data_q[db].signs[t / 8u] = uint8_t((ballot.x >> (local_byte * 8u)) & 0xFFu);
+    }
+#elif defined(DATA_A_TURBO4_0)
+    uint idx = 0u;
+    if (val < T4M[7]) {
+        if (val < T4M[3]) {
+            if (val < T4M[1]) idx = (val < T4M[0]) ? 0u : 1u;
+            else idx = (val < T4M[2]) ? 2u : 3u;
+        } else {
+            if (val < T4M[5]) idx = (val < T4M[4]) ? 4u : 5u;
+            else idx = (val < T4M[6]) ? 6u : 7u;
+        }
+    } else {
+        if (val < T4M[11]) {
+            if (val < T4M[9]) idx = (val < T4M[8]) ? 8u : 9u;
+            else idx = (val < T4M[10]) ? 10u : 11u;
+        } else {
+            if (val < T4M[13]) idx = (val < T4M[12]) ? 12u : 13u;
+            else idx = (val < T4M[14]) ? 14u : 15u;
+        }
+    }
+    uint sg_lane = gl_SubgroupInvocationID;
+    uint partner_idx = subgroupShuffle(idx, sg_lane ^ 1u);
+    uint byte_val = ((sg_lane & 1u) == 0u) ? (idx | (partner_idx << 4u)) : (partner_idx | (idx << 4u));
+    if ((sg_lane & 1u) == 0u) {
+        data_q[db].qs[t / 2u] = uint8_t(byte_val);
+    }
+#endif
+
+#if defined(DATA_A_TURBO3_0)
+    float rc = TC[idx] * TC[idx];
+    rc = subgroupAdd(rc);
+    if (gl_SubgroupInvocationID == 0) sg_acc[gl_SubgroupID] = rc;
+    barrier();
+    if (t == 0u) {
+        float total = 0.0;
+        for (uint w = 0; w < gl_NumSubgroups; w++) total += sg_acc[w];
+        float rn = sqrt(total);
+        data_q[db].norm = float16_t((rn > 1e-10) ? (gnrm / rn) : gnrm);
+    }
+#else
+    if (t == 0u) {
+        data_q[db].norm = float16_t(gnrm);
+    }
+#endif
+}
+#elif defined(SET_ROWS) && (defined(DATA_A_TQ4_1S) || defined(DATA_A_TQ3_1S))
+
+void main() {
+    const uint t   = gl_LocalInvocationID.x;    // 0..31, one per block element
+    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint gpr = p.ne00 / 32;  // blocks per row
+
+    if (gpr == 0) return;
+    if (g >= p.ne / 32) return;
+
+    uint tmp = g;
+    const uint ig  = tmp % gpr; tmp /= gpr;
+    const uint i01 = tmp % p.ne01; tmp /= p.ne01;
+    const uint i02 = tmp % p.ne12;
+    const uint i03 = tmp / p.ne12;
+
+    const uint sb  = src0_idx(ig * 32, i01, i02, i03) + get_aoffset();
+    const uint i1  = data_i[src1_idx(i01, fastmod(i02, p.ne11), fastmod(i03, p.ne12), 0) + get_boffset()] DATA_I_SWIZZLE;
+    const uint db  = dst_idx(ig, i1, i02, i03) + get_doffset();
+
+    // Step 1: load one f32 input per thread
+    float val = data_s[sb + t];
+
+    // Step 2: Forward RHT via subgroup ops
+    // Sign flip
+    val *= TQ_SIGNS[t];
+
+    // WHT butterfly via subgroupShuffleXor
+    for (uint h = 1u; h < 32u; h <<= 1u) {
+        const float other = subgroupShuffleXor(val, h);
+        val = ((t & h) == 0u) ? (val + other) : (other - val);
+    }
+
+    // Normalize
+    val *= TQ_INV_SQRT32;
+
+    // Step 3: Dual half-block RMS scale computation
+    float sq = val * val;
+    float sum_sq_lo = subgroupAdd((t < 16u) ? sq : 0.0);
+    float sum_sq_hi = subgroupAdd((t >= 16u) ? sq : 0.0);
+    float rms_lo = sqrt(sum_sq_lo / 16.0);
+    float rms_hi = sqrt(sum_sq_hi / 16.0);
+
+    // Step 4: Scale search (9 points)
+    const float SCALES[9] = float[9](0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.35, 1.5);
+    float best_d0 = rms_lo;
+    float best_d1 = rms_hi;
+    float best_err_total = 1e30;
+
+    for (uint si = 0u; si < 9u; si++) {
+        float d0 = rms_lo * SCALES[si];
+        float d1 = rms_hi * SCALES[si];
+        float inv = (t < 16u)
+            ? ((d0 > 1e-10) ? 1.0 / d0 : 0.0)
+            : ((d1 > 1e-10) ? 1.0 / d1 : 0.0);
+
+#if defined(DATA_A_TQ3_1S)
+        uint idx = tq3_choose_index(val * inv);
+        float c = TQ3_CENTROIDS[idx];
+#else
+        uint idx = tq4_choose_index(val * inv);
+        float c = TQ4_CENTROIDS[idx];
+#endif
+        float d = (t < 16u) ? d0 : d1;
+        float diff2 = val - c * d;
+        float local_err = diff2 * diff2;
+
+        float err_total = subgroupAdd(local_err);
+        if (err_total < best_err_total) {
+            best_err_total = err_total;
+            best_d0 = d0;
+            best_d1 = d1;
+        }
+    }
+
+    // Step 5: Iterative refinement (6 iterations)
+    for (uint iter = 0u; iter < 6u; iter++) {
+        float inv = (t < 16u)
+            ? ((best_d0 > 1e-10) ? 1.0 / best_d0 : 0.0)
+            : ((best_d1 > 1e-10) ? 1.0 / best_d1 : 0.0);
+
+#if defined(DATA_A_TQ3_1S)
+        uint idx = tq3_choose_index(val * inv);
+        float c = TQ3_CENTROIDS[idx];
+#else
+        uint idx = tq4_choose_index(val * inv);
+        float c = TQ4_CENTROIDS[idx];
+#endif
+
+        float num_lo = subgroupAdd((t < 16u) ? val * c : 0.0);
+        float den_lo = subgroupAdd((t < 16u) ? c * c   : 0.0);
+        float num_hi = subgroupAdd((t >= 16u) ? val * c : 0.0);
+        float den_hi = subgroupAdd((t >= 16u) ? c * c   : 0.0);
+
+        if (den_lo > 1e-10) best_d0 = num_lo / den_lo;
+        if (den_hi > 1e-10) best_d1 = num_hi / den_hi;
+    }
+
+    // Step 6: Final quantization
+    float inv_final = (t < 16u)
+        ? ((best_d0 > 1e-10) ? 1.0 / best_d0 : 0.0)
+        : ((best_d1 > 1e-10) ? 1.0 / best_d1 : 0.0);
+#if defined(DATA_A_TQ3_1S)
+    uint cidx = tq3_choose_index(val * inv_final);
+#else
+    uint cidx = tq4_choose_index(val * inv_final);
+#endif
+
+    // Step 7: Packing
+#if defined(DATA_A_TQ4_1S)
+    uint partner_idx = subgroupShuffle(cidx, t ^ 1u);
+    uint byte_val = ((t & 1u) == 0u) ? (cidx | (partner_idx << 4u)) : (partner_idx | (cidx << 4u));
+    if ((t & 1u) == 0u) {
+        data_q[db].qs[t >> 1u] = uint8_t(byte_val);
+    }
+#else
+    // TQ3_1S packing: 8 values -> 3 bytes
+    // Thread 0-7: byte 0, 1, 2
+    uint v0 = subgroupShuffle(cidx, 0);
+    uint v1 = subgroupShuffle(cidx, 1);
+    uint v2 = subgroupShuffle(cidx, 2);
+    uint v3 = subgroupShuffle(cidx, 3);
+    uint v4 = subgroupShuffle(cidx, 4);
+    uint v5 = subgroupShuffle(cidx, 5);
+    uint v6 = subgroupShuffle(cidx, 6);
+    uint v7 = subgroupShuffle(cidx, 7);
+
+    if (t == 0) {
+        data_q[db].qs[0] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[1] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[2] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 8);
+    v1 = subgroupShuffle(cidx, 9);
+    v2 = subgroupShuffle(cidx, 10);
+    v3 = subgroupShuffle(cidx, 11);
+    v4 = subgroupShuffle(cidx, 12);
+    v5 = subgroupShuffle(cidx, 13);
+    v6 = subgroupShuffle(cidx, 14);
+    v7 = subgroupShuffle(cidx, 15);
+
+    if (t == 0) {
+        data_q[db].qs[3] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[4] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[5] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 16);
+    v1 = subgroupShuffle(cidx, 17);
+    v2 = subgroupShuffle(cidx, 18);
+    v3 = subgroupShuffle(cidx, 19);
+    v4 = subgroupShuffle(cidx, 20);
+    v5 = subgroupShuffle(cidx, 21);
+    v6 = subgroupShuffle(cidx, 22);
+    v7 = subgroupShuffle(cidx, 23);
+
+    if (t == 0) {
+        data_q[db].qs[6] = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[7] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[8] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+
+    v0 = subgroupShuffle(cidx, 24);
+    v1 = subgroupShuffle(cidx, 25);
+    v2 = subgroupShuffle(cidx, 26);
+    v3 = subgroupShuffle(cidx, 27);
+    v4 = subgroupShuffle(cidx, 28);
+    v5 = subgroupShuffle(cidx, 29);
+    v6 = subgroupShuffle(cidx, 30);
+    v7 = subgroupShuffle(cidx, 31);
+
+    if (t == 0) {
+        data_q[db].qs[9]  = uint8_t(v0 | (v1 << 3) | ((v2 & 3) << 6));
+        data_q[db].qs[10] = uint8_t((v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 1) << 7));
+        data_q[db].qs[11] = uint8_t((v5 >> 1) | (v6 << 2) | (v7 << 5));
+    }
+#endif
+
+    // Step 8: Store scales (thread 0 writes both)
+    if (t == 0u) {
+        data_q[db].d0 = float16_t(best_d0);
+        data_q[db].d1 = float16_t(best_d1);
+    }
+}
+#elif defined(SET_ROWS)
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
