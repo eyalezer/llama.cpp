@@ -45,6 +45,8 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_q5_0.metal
     kernels/fa_q5_1.metal
     kernels/fa_q8_0.metal
+    kernels/fa_turbo.metal
+    kernels/fa_turbo_flash.metal
     kernels/fa_vec_f16.metal
     kernels/fa_vec_f32.metal
     kernels/fa_vec_q4_0.metal
@@ -52,6 +54,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa_vec_q5_0.metal
     kernels/fa_vec_q5_1.metal
     kernels/fa_vec_q8_0.metal
+    kernels/fa_vec_turbo.metal
     kernels/mul_mv.metal
     kernels/mul_mv_mma.metal
     kernels/mul_mm.metal
