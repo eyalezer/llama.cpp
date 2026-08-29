@@ -664,9 +664,10 @@ class DFlashModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
-        block_size = self.hparams.get("block_size", 16)
-        self.gguf_writer.add_block_size(block_size)
         dflash_config = self.hparams.get("dflash_config", {})
+
+        block_size = dflash_config.get("block_size", self.hparams.get("block_size", 16))
+        self.gguf_writer.add_block_size(block_size)
 
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
@@ -688,7 +689,6 @@ class DFlashModel(Qwen3Model):
             name = "model." + name
         return super().filter_tensors((name, gen))
 
-
 @ModelBase.register("Qwen3DSparkModel")
 class DSparkModel(DFlashModel):
     # DSpark = DFlash + a semi-autoregressive Markov head
@@ -707,3 +707,4 @@ class DSparkModel(DFlashModel):
         if name.endswith(("embed_tokens.weight", "lm_head.weight")):
             return None
         return super().filter_tensors((name, gen))
+

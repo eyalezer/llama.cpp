@@ -27,6 +27,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
             return false;
@@ -120,6 +121,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
 }
 // instantiate for external usage:
 template void llama_model_saver::add_kv<std::vector<uint32_t>>(const enum llm_kv, const std::vector<uint32_t> &, const bool);
+template void llama_model_saver::add_kv<std::vector<float>>(const enum llm_kv, const std::vector<float> &, const bool);
 
 void llama_model_saver::add_kv(const enum llm_kv key, const std::vector<std::string> & value) {
     std::vector<const char *> tmp(value.size());
