@@ -98,6 +98,7 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 #define O_TYPEV4 FLOAT_TYPEV4
 #endif
 
+
 // These can't be `const` globals because GLSL forbids function calls in global
 // const initializers, even when the spec constants would let the driver fold
 // them. Macros expand at the use site and fold after specialization.

@@ -292,11 +292,17 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                                      ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(indexer_k, "indexer_k", il);
 
-                // perform Hadamard transform on indexer q and k
-                indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
-                cb(indexer_q, "indexer_q", il);
-                indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
-                cb(indexer_k, "indexer_k", il);
+                // perform Hadamard transform on indexer q and k when the LID cache
+                // has rotation enabled (the kv-cache attn_rot override guarantees the
+                // rot tensor for DeepSeek DSA archs; GLM-DSA stores indexer K
+                // unrotated, so skip the transform to stay consistent with the
+                // write side)
+                if (inp_attn_dsa->self_k_rot_lid) {
+                    indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
+                    cb(indexer_q, "indexer_q", il);
+                    indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
+                    cb(indexer_k, "indexer_k", il);
+                }
 
                 // store indexer keys to KV cache
                 const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();

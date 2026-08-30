@@ -10,16 +10,28 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
+    // Route all TQ weights through the rotated mul_mm path.
+    // Gemma4 decode still degrades on the fused mul_mv kernel even after the broader
+    // TQ backend fixes, while the rotated mul_mm path matches CPU behavior.
+    const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
+
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
+           has_simdgroup_mm && ne00 >= 64 && (ne11 > 8 || is_tq_weight);
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
+    // find the break-even point where the matrix-matrix kernel becomes more efficient compared
+    // to the matrix-vector kernel
+    // ne20 = n_used_experts
+    // ne21 = n_rows (batch size)
+    const bool is_tq_weight = (op->src[0]->type == GGML_TYPE_TQ3_1S || op->src[0]->type == GGML_TYPE_TQ4_1S);
+    const int64_t ne21_mm_id_min = is_tq_weight ? 1 : 32;
+
+    return has_simdgroup_mm && ne00 >= 64 && ne21 >= ne21_mm_id_min;
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)

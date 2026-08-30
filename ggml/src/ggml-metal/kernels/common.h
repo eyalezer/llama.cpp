@@ -68,6 +68,23 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// UE4M3 scale decode for NVFP4. Folds *0.5 to pair with the x2 kvalues_mxfp4
+// table (matches ggml_ue4m3_to_fp32 on the CPU/CUDA reference).
+static inline float nvfp4_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    int   exp = (x >> 3) & 0xF;
+    int   man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexp((float) man, -9);
+    } else {
+        raw = ldexp(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return raw * 0.5f;
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }

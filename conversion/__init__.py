@@ -61,7 +61,10 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Lfm2DSparkDraftModel": "qwen",
     "LingDSparkModel": "qwen",
     "DeepseekV4ForCausalLM": "deepseek",
+    "DFlashLagunaForCausalLM": "laguna",
+
     "DeepseekV4DSparkModel": "deepseek",
+
     "DistilBertForMaskedLM": "bert",
     "DistilBertForSequenceClassification": "bert",
     "DistilBertModel": "bert",
@@ -79,7 +82,6 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Exaone4ForCausalLM": "exaone",
     "ExaoneForCausalLM": "exaone",
     "ExaoneMoEForCausalLM": "exaone",
-    "ExaoneMoeForCausalLM": "exaone",
     "FalconForCausalLM": "falcon",
     "FalconH1ForCausalLM": "falcon_h1",
     "FalconMambaForCausalLM": "mamba",

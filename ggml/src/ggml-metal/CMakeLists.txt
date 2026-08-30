@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-context.m
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
+                         ggml-metal-moe-cache.mm
                         )
 
 target_link_libraries(ggml-metal PRIVATE
@@ -50,6 +51,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/turbo_quant.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

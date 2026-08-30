@@ -11,7 +11,6 @@ GGUF_MAGIC             = 0x46554747  # "GGUF"
 GGUF_VERSION           = 3
 GGUF_DEFAULT_ALIGNMENT = 32
 GGML_QUANT_VERSION     = 2  # GGML_QNT_VERSION from ggml.h
-GGML_MAX_DIMS          = 4  # GGML_MAX_DIMS from ggml.h
 
 #
 # metadata keys
@@ -170,6 +169,7 @@ class Keys:
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
+        DECODER_ARCH                      = "{arch}.decoder_arch"
 
     class Adapters:
         COUNT                = "{arch}.adapters.count"
@@ -202,9 +202,9 @@ class Keys:
         OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
         OUTPUT_LORA_RANK             = "{arch}.attention.output_lora_rank"
         OUTPUT_SCALE                 = "{arch}.attention.output_scale"
-        VALUE_SCALE                  = "{arch}.attention.value_scale"
         COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
         COMPRESS_ROPE_FREQ_BASE      = "{arch}.attention.compress_rope_freq_base"
+        VALUE_SCALE                  = "{arch}.attention.value_scale"
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
         KEY_LENGTH_MLA               = "{arch}.attention.key_length_mla"
         VALUE_LENGTH_MLA             = "{arch}.attention.value_length_mla"
@@ -363,7 +363,6 @@ class Keys:
         PROJECTOR_TYPE        = "clip.projector_type"
         HAS_VISION_ENCODER    = "clip.has_vision_encoder"
         HAS_AUDIO_ENCODER     = "clip.has_audio_encoder"
-        HAS_GEN_AUDIO_ENCODER = "clip.has_gen_audio_encoder"
         HAS_LLAVA_PROJECTOR   = "clip.has_llava_projector"
 
     class ClipVision:
@@ -850,6 +849,7 @@ class MODEL_TENSOR(IntEnum):
     ENC_FFN_DOWN         = auto()
     ENC_FFN_UP           = auto()
     ENC_OUTPUT_NORM      = auto()
+    ENC_AUX_NORM         = auto()
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
@@ -1301,9 +1301,9 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK:         "deepseek",
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
-    MODEL_ARCH.DEEPSEEK32:       "deepseek32",
     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
     MODEL_ARCH.GLM_DSA:          "glm-dsa",
@@ -1395,6 +1395,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MASKED_EMBD_CENTROIDS:     "masked_embd_centroids",
     MODEL_TENSOR.MASKED_EMBD_ORDERING:      "masked_embd_ordering",
     MODEL_TENSOR.POS_EMBD:                  "position_embd",
+    MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
     MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
@@ -1445,8 +1448,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_DOWN_EXP:              "blk.{bid}.ffn_down_exps",
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
-    MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
+    MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
@@ -1597,6 +1600,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENC_FFN_DOWN:              "enc.blk.{bid}.ffn_down",
     MODEL_TENSOR.ENC_FFN_UP:                "enc.blk.{bid}.ffn_up",
     MODEL_TENSOR.ENC_OUTPUT_NORM:           "enc.output_norm",
+    MODEL_TENSOR.ENC_AUX_NORM:              "enc.aux_norm",
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
@@ -2751,13 +2755,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_NORM,
         MODEL_TENSOR.SSM_IN,
         MODEL_TENSOR.SSM_BETA_ALPHA,
-        MODEL_TENSOR.SSM_OUT,
-        MODEL_TENSOR.NEXTN_EH_PROJ,
-        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
-        MODEL_TENSOR.NEXTN_ENORM,
-        MODEL_TENSOR.NEXTN_HNORM,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+        MODEL_TENSOR.SSM_OUT
     ],
     MODEL_ARCH.QWEN3VL: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -3714,13 +3712,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors
-        MODEL_TENSOR.NEXTN_EH_PROJ,
-        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
-        MODEL_TENSOR.NEXTN_ENORM,
-        MODEL_TENSOR.NEXTN_HNORM,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
-        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.DEEPSEEK2OCR: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5037,6 +5028,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+
         MODEL_TENSOR.ATTN_SINKS,
         MODEL_TENSOR.ATTN_Q_A,
         MODEL_TENSOR.ATTN_Q_B,
@@ -5054,6 +5047,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.HC_HEAD_FN,
         MODEL_TENSOR.HC_HEAD_BASE,
         MODEL_TENSOR.HC_HEAD_SCALE,
+
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
@@ -5511,12 +5505,18 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    TQ3_1S  = 45
+    TQ4_1S  = 46
+    Q8_CR   = 48
+    Q5_CR   = 49
+    Q6_CR   = 50
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX       = 1
-    SIGMOID       = 2
-    SQRTSOFTPLUS  = 4
+    SOFTMAX        = 1
+    SIGMOID        = 2
+    SOFTMAX_WEIGHT = 3
+    SQRTSOFTPLUS   = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h
@@ -5567,6 +5567,12 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_Q8_CR         = 42  # except 1d tensors, ConvRot-rotated Q8_0
+    MOSTLY_TQ3_1S        = 43  # except 1d tensors
+    MOSTLY_TQ4_1S        = 44  # except 1d tensors
+    MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
+    MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
+
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5703,6 +5709,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
+    GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
+    # same layout as Q8_0, but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q8_CR:   (256, 8 * (2 + 32)),
+    # same layout as Q5_0, but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q5_CR:   (256, 8 * (2 + 4 + 16)),
+    # same layout as Q6_K (256 elements/block), but the rows are rotated in groups of 256 (ConvRot)
+    GGMLQuantizationType.Q6_CR:   (256, 2 + 128 + 64 + 16),   # block_q6_K: d(2)+ql(128)+qh(64)+scales(16)
 }
 
 
