@@ -3,6 +3,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+// From ggml-metal-moe-cache.mm
+extern "C" void ggml_metal_moe_cache_register(void * reg);
+
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
@@ -999,6 +1002,11 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
         initialized = true;
     }
+
+    // No GGML_USE_* guard: that macro is defined for consumers of the backend
+    // (ggml-backend-reg.cpp), not for this target, so guarding here compiled the
+    // registration out entirely and the provider never installed.
+    ggml_metal_moe_cache_register(&reg);
 
     return &reg;
 }

@@ -12,6 +12,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-context.m
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
+                         ggml-metal-moe-cache.mm
                         )
 
 target_link_libraries(ggml-metal PRIVATE

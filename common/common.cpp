@@ -1409,6 +1409,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
+        const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+        const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
+        if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
+            COM_INF("%s", "MoE cache: mode=off\n");
+        } else if (params.moe_cache.budget_mib > 0) {
+            COM_INF("MoE cache: mode=%s budget=%zu MiB/device%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, params.moe_cache.budget_mib, placement);
+        } else {
+            COM_INF("MoE cache: mode=%s budget=free-minus-reserve%s; use -lv 4 for resolved backend state, actual pools, and statistics\n", mode, placement);
+        }
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1722,6 +1736,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+static enum llama_moe_cache_mode common_moe_cache_to_llama(enum common_moe_cache_mode mode) {
+    switch (mode) {
+        case COMMON_MOE_CACHE_MODE_OFF:   return LLAMA_MOE_CACHE_MODE_OFF;
+        case COMMON_MOE_CACHE_MODE_AUTO:  return LLAMA_MOE_CACHE_MODE_AUTO;
+        case COMMON_MOE_CACHE_MODE_ON:
+        case COMMON_MOE_CACHE_MODE_SOFT:  return LLAMA_MOE_CACHE_MODE_ON;
+    }
+    return LLAMA_MOE_CACHE_MODE_UNSPECIFIED;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1755,6 +1779,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    if (params.moe_cache.mode_explicit) {
+        cparams.moe_cache_mode = common_moe_cache_to_llama(params.moe_cache.mode);
+        cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -12,6 +12,93 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-moe-cache.h"
+
+#include <algorithm>
+#include <mutex>
+#include <vector>
+
+// MoE expert cache providers, keyed by backend registration object. Multiple
+// backends (CUDA, Metal, Vulkan, HIP) can register; each scheduler picks the
+// provider that owns a device in its backend set.
+static std::mutex g_moe_cache_registry_mu;
+static std::vector<ggml_moe_cache_api> g_moe_cache_providers;
+
+void ggml_moe_cache_register(const ggml_moe_cache_api * api) {
+    if (!api || !api->owner || !api->session_create || !api->session_destroy ||
+        !api->session_enter || !api->session_leave) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (ggml_moe_cache_api & existing : g_moe_cache_providers) {
+        if (existing.owner == api->owner) {
+            existing = *api; // refresh: a rebuilt library re-registers
+            return;
+        }
+    }
+    g_moe_cache_providers.push_back(*api);
+}
+
+void ggml_moe_cache_unregister(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    g_moe_cache_providers.erase(
+        std::remove_if(g_moe_cache_providers.begin(), g_moe_cache_providers.end(),
+            [owner](const ggml_moe_cache_api & api) { return api.owner == owner; }),
+        g_moe_cache_providers.end());
+}
+
+ggml_moe_cache_api ggml_moe_cache_get(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.owner == owner) {
+            return api;
+        }
+    }
+    return ggml_moe_cache_api{};
+}
+
+// The provider table the current thread is executing under. Set by the
+// scheduler scope while a graph with a cache session runs; the CPU backend
+// reads it to reach the session's provider callbacks.
+static thread_local ggml_moe_cache_api t_moe_cache_active;
+
+ggml_moe_cache_api ggml_moe_cache_active(void) {
+    if (t_moe_cache_active.owner) {
+        return t_moe_cache_active;
+    }
+    // Direct CPU users outside a scheduler scope fall back to the first
+    // registered provider.
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.session_create && api.session_destroy) {
+            return api;
+        }
+    }
+    return ggml_moe_cache_api{};
+}
+
+// Providers whose backend owns at least one device in the scheduler set, in
+// registration order. Returns copies: the scheduler keeps the selected copy
+// with its session so later registration changes cannot alter the callbacks.
+static std::vector<ggml_moe_cache_api> ggml_moe_cache_provider_candidates(
+        void * const * backends, int n_backends) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    std::vector<ggml_moe_cache_api> result;
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (!api.session_create || !api.session_destroy ||
+            !api.session_enter || !api.session_leave) {
+            continue;
+        }
+        for (int b = 0; b < n_backends; b++) {
+            ggml_backend_dev_t device = ggml_backend_get_device((ggml_backend_t) backends[b]);
+            if (device && (const void *) ggml_backend_dev_backend_reg(device) == api.owner) {
+                result.push_back(api);
+                break;
+            }
+        }
+    }
+    return result;
+}
 
 #include <assert.h>
 #include <limits.h>
@@ -20,7 +107,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
-#include <unordered_map>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -65,14 +152,6 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
         assert(size >= ggml_nbytes(tensor));
-
-        // [TAG_ALLOC_SIZE_EXPAND]
-        // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
-        GGML_ASSERT(size <= ggml_nbytes(tensor) ||
-                    ggml_op_is_empty(tensor->op) ||
-                    ggml_is_quantized(tensor->type) || // [TAG_ALLOC_SIZE_EXPAND]
-                    ggml_op_alloc_size_may_expand(tensor->op));
-
         return size;
     }
     return ggml_nbytes(tensor);
@@ -89,6 +168,26 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
 ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->device;
+}
+
+static void ggml_backend_moe_cache_invalidate_buffer(
+        ggml_backend_buffer_t buffer, const void * address, size_t size) {
+    if (!buffer || !address || size == 0 ||
+        buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        !ggml_backend_buffer_is_host(buffer)) {
+        return;
+    }
+    // Each registered provider invalidates its own sessions.
+    std::vector<ggml_moe_cache_api> providers;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+        providers = g_moe_cache_providers;
+    }
+    for (const ggml_moe_cache_api & api : providers) {
+        if (api.invalidate) {
+            api.invalidate(address, size);
+        }
+    }
 }
 
 // backend buffer
@@ -116,6 +215,15 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
 void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
     if (buffer == NULL) {
         return;
+    }
+
+    // Host weight buffers can back queued cache-fill jobs.
+    if (buffer->iface.get_base) {
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (base) {
+            ggml_backend_moe_cache_invalidate_buffer(
+                    buffer, base, ggml_backend_buffer_get_size(buffer));
+        }
     }
 
     if (buffer->iface.free_buffer != NULL) {
@@ -165,6 +273,10 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
         return;
     }
 
+    if (buffer->iface.get_base) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     buffer->iface.clear(buffer, value);
 }
 
@@ -186,13 +298,15 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
 
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
+    if (usage != buffer->usage && buffer->iface.get_base) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     buffer->usage = usage;
 
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
         ggml_backend_multi_buffer_set_usage(buffer, usage);
-    } else if (ggml_backend_buffer_is_meta(buffer)) {
-        ggml_backend_meta_buffer_set_usage(buffer, usage);
     }
 }
 
@@ -209,6 +323,10 @@ ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t bu
 void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     if (buffer->iface.reset) {
+        if (buffer->iface.get_base) {
+            ggml_backend_moe_cache_invalidate_buffer(
+                    buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+        }
         buffer->iface.reset(buffer);
     }
 }
@@ -216,6 +334,8 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
     }
     return false;
@@ -272,6 +392,9 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        ggml_backend_moe_cache_invalidate_buffer(
+                buf, (const char *) tensor->data + offset, size);
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -308,6 +431,10 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset,
+            (n_copies - 1)*stride_tensor + size);
     backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -344,6 +471,8 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset, size);
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
@@ -381,6 +510,9 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset,
+            (n_copies - 1)*stride_tensor + size);
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -419,6 +551,8 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(buf->iface.memset_tensor != NULL && "memset not implemented by backend buffer");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset, size);
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
@@ -492,9 +626,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (ggml_backend_buffer_is_host(src_buf)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+    } else if (ggml_backend_buffer_is_host(dst_buf)) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
@@ -517,6 +655,9 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
 
     GGML_ASSERT(backend_dst);
     if (backend_dst->iface.cpy_tensor_async != NULL) {
+        ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
             return;
         }
@@ -822,6 +963,10 @@ struct ggml_backend_sched {
     int graph_inputs_capacity;
 
     struct ggml_context * ctx;
+    void * moe_cache_session;
+    // The provider table selected for this session. Copied at creation so a
+    // later registration change cannot alter the session's callbacks.
+    struct ggml_moe_cache_api moe_cache_api;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1439,40 +1584,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    // optimize the split graphs and collect the allocation dependencies added by the backends
-    // this needs to happen before we make graph_copy, so they are in sync
-    // TODO: this may create many small allocations in the scheduler, restructure to use a flat array
-    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> alloc_deps;
-
-    struct ggml_backend_graph_optimize_params opt_params = {
-        /* .add_alloc_dep = */ [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
-            auto & deps = *(std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> *) user_data;
-            std::vector<ggml_tensor *> & keep = deps[until];
-            if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) {
-                keep.push_back(tensor);
-            }
-        },
-        /* .user_data     = */ &alloc_deps,
-    };
-
-    for (int i = 0; i < sched->n_splits; i++) {
-        struct ggml_backend_sched_split * split = &sched->splits[i];
-        split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
-
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
-    }
-
-    // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
-    int n_dep_nodes = 0;
-    for (const auto & it : alloc_deps) {
-        n_dep_nodes += (it.second.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC;
-    }
-
     int total_inputs = sched->n_graph_inputs;
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1490,10 +1606,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
-    int n_dep_nodes_added = 0;
-
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
+        split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+
+        // Optimize this split of the graph. This needs to happen before we make graph_copy,
+        // so they are in sync.
+        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, nullptr);
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
@@ -1518,31 +1637,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             assert(graph_copy->size > graph_copy->n_nodes);
             sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
-
-            if (alloc_deps.empty()) {
-                continue;
-            }
-
-            // add a dependency node so that the kept tensors are not freed before this node is computed
-            auto it = alloc_deps.find(graph->nodes[j]);
-            if (it != alloc_deps.end()) {
-                const std::vector<ggml_tensor *> & keep = it->second;
-                for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
-                    struct ggml_tensor * dep = ggml_view_tensor(sched->ctx, keep[k]);
-                    for (size_t s = 0; s < GGML_MAX_SRC && k + s < keep.size(); s++) {
-                        dep->src[s] = keep[k + s];
-                    }
-                    assert(graph_copy->size > graph_copy->n_nodes);
-                    sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
-                    graph_copy->nodes[graph_copy->n_nodes++] = dep;
-                    n_dep_nodes_added++;
-                }
-            }
         }
     }
-
-    // a mismatch means a backend added a dep with an `until` tensor that is not a node of the optimized graph
-    GGML_ASSERT(n_dep_nodes_added == n_dep_nodes);
 
     if (sched->n_copies > 1) {
         // add input copies as leafs so that they are allocated first
@@ -1644,26 +1740,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    struct moe_cache_scope {
+        void * session;
+        void (*leave)(void *);
+        ggml_moe_cache_api previous_active;
+
+        explicit moe_cache_scope(void * session, void (*enter)(void *),
+                                 void (*leave_fn)(void *),
+                                 const ggml_moe_cache_api & active_api)
+            : session(session), leave(leave_fn), previous_active(t_moe_cache_active) {
+            t_moe_cache_active = active_api;
+            if (enter && leave) {
+                enter(session);
+            } else {
+                leave = nullptr;
+            }
+        }
+
+        ~moe_cache_scope() {
+            t_moe_cache_active = previous_active;
+            if (leave) {
+                leave(session);
+            }
+        }
+    } cache_scope(sched->moe_cache_session,
+                  sched->moe_cache_api.session_enter,
+                  sched->moe_cache_api.session_leave,
+                  sched->moe_cache_api);
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
-
-    int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
-            }
-        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1827,12 +1939,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this split
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        // record the event of this copy
+        if (split->n_inputs > 0) {
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
         }
-
-        prev_backend_id = split_backend_id;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1902,6 +2014,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    {
+        void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+        for (int b = 0; b < n_backends; b++) {
+            cache_backends[b] = backends[b];
+        }
+        for (const ggml_moe_cache_api & api :
+                ggml_moe_cache_provider_candidates(cache_backends, n_backends)) {
+            void * session = api.session_create(cache_backends, n_backends, nullptr);
+            if (session) {
+                sched->moe_cache_session = session;
+                sched->moe_cache_api = api;
+                break;
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -1910,9 +2038,58 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_set_moe_cache(
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
+    GGML_ASSERT(sched);
+    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
+        return;
+    }
+
+    if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
+        sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+    }
+    sched->moe_cache_session = nullptr;
+    sched->moe_cache_api = ggml_moe_cache_api{};
+    if (mode == GGML_MOE_CACHE_MODE_OFF) {
+        return;
+    }
+
+    void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+    for (int index = 0; index < sched->n_backends; index++) {
+        cache_backends[index] = sched->backends[index];
+    }
+
+    // Probe the providers against this scheduler's backend set and pick the
+    // first one that can create a session, retrying another provider when
+    // session_create returns null.
+    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    bool provider_tried = false;
+    for (const ggml_moe_cache_api & api :
+            ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
+        ggml_moe_cache_config config = {};
+        if (!api.query_config || !api.query_config(automatic, budget_mib, &config)) {
+            continue;
+        }
+        provider_tried = true;
+        void * session = api.session_create(cache_backends, sched->n_backends, &config);
+        if (session) {
+            sched->moe_cache_session = session;
+            sched->moe_cache_api = api;
+            break;
+        }
+    }
+    if (provider_tried && !sched->moe_cache_session) {
+        GGML_LOG_INFO("[moe-cache] session creation failed: all candidate providers returned null\n");
+    }
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
+        sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+        sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2096,8 +2273,6 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
     return sched->backends[backend_index];
 }
 
-// utils
-
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
@@ -2111,6 +2286,8 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
             return false;
     }
 }
+
+// utils
 
 enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
