@@ -1,6 +1,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-dl.h"
+#include "ggml-backend-moe-cache.h"
 #include "ggml-impl.h"
 #include <algorithm>
 #include <cstring>
@@ -278,6 +279,8 @@ struct ggml_backend_registry {
             GGML_LOG_DEBUG("%s: unloading %s backend\n", __func__, ggml_backend_reg_name(reg));
         }
 
+        ggml_moe_cache_unregister(reg);
+
         // remove devices
         devices.erase(
             std::remove_if(devices.begin(), devices.end(),
@@ -490,13 +493,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 #endif
         // default search paths: executable directory, current directory
         search_paths.push_back(get_executable_path());
-        std::error_code cwd_ec;
-        const fs::path cwd = fs::current_path(cwd_ec);
-        if (cwd_ec) {
-            GGML_LOG_DEBUG("%s: current_path() failure, error-message: %s\n", __func__, cwd_ec.message().c_str());
-        } else {
-            search_paths.push_back(cwd);
-        }
+        search_paths.push_back(fs::current_path());
     } else {
         search_paths.push_back(fs::u8path(user_search_path));
     }
@@ -514,14 +511,8 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             }
             continue;
         }
-        std::error_code dir_ec;
-        fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied, dir_ec);
-        if (dir_ec) {
-            GGML_LOG_DEBUG("%s: failed to enumerate %s: %s\n", __func__, path_str(search_path).c_str(), dir_ec.message().c_str());
-            continue;
-        }
-        for (const fs::directory_iterator end; dir_it != end; dir_it.increment(dir_ec)) {
-            const auto & entry = *dir_it;
+        fs::directory_iterator dir_it(search_path, fs::directory_options::skip_permission_denied);
+        for (const auto & entry : dir_it) {
             if (entry.is_regular_file(ec)) {
                 auto filename = entry.path().filename();
                 auto ext = entry.path().extension();
