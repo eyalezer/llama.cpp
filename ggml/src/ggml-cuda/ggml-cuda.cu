@@ -65,6 +65,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
+#include "ggml-cuda/chain.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -3502,6 +3503,153 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    static bool disable_chain = getenv("GGML_CUDA_FUSE_CHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_CHAIN")) == 0;
+
+    auto chain_code = [](const ggml_tensor * t, int & code, float & p0, float & p1) -> bool {
+        switch (t->op) {
+            case GGML_OP_ADD:   code = TQ_CHAIN_ADD;   return true;
+            case GGML_OP_MUL:   code = TQ_CHAIN_MUL;   return true;
+            case GGML_OP_DIV:   code = TQ_CHAIN_DIV;   return true;
+            case GGML_OP_SCALE: code = TQ_CHAIN_SCALE;
+                memcpy(&p0, (const char *) t->op_params + 0*sizeof(float), sizeof(float));
+                memcpy(&p1, (const char *) t->op_params + 1*sizeof(float), sizeof(float));
+                return true;
+            case GGML_OP_CLAMP: code = TQ_CHAIN_CLAMP;
+                memcpy(&p0, (const char *) t->op_params + 0*sizeof(float), sizeof(float));
+                memcpy(&p1, (const char *) t->op_params + 1*sizeof(float), sizeof(float));
+                return true;
+            case GGML_OP_SQR:   code = TQ_CHAIN_SQR;   return true;
+            case GGML_OP_UNARY:
+                switch (ggml_get_unary_op(t)) {
+                    case GGML_UNARY_OP_SILU:     code = TQ_CHAIN_SILU;     return true;
+                    case GGML_UNARY_OP_SIGMOID:  code = TQ_CHAIN_SIGMOID;  return true;
+                    case GGML_UNARY_OP_SOFTPLUS: code = TQ_CHAIN_SOFTPLUS; return true;
+                    case GGML_UNARY_OP_GELU:     code = TQ_CHAIN_GELU;     return true;
+                    case GGML_UNARY_OP_RELU:     code = TQ_CHAIN_RELU;     return true;
+                    case GGML_UNARY_OP_NEG:      code = TQ_CHAIN_NEG;      return true;
+                    default: return false;
+                }
+            default: return false;
+        }
+    };
+
+    auto chain_ok_tensor = [](const ggml_tensor * t) -> bool {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+
+    tq_chain_desc desc = {};
+    const ggml_tensor * head_src = nullptr;
+    int len = 0;
+
+    if (!disable_chain) {
+        const ggml_tensor * prev = nullptr;
+        for (int j = i; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
+            ggml_tensor * nd = cgraph->nodes[j];
+            int code = 0; float p0 = 0.0f, p1 = 0.0f;
+
+            if (!chain_ok_tensor(nd) || !chain_code(nd, code, p0, p1)) break;
+            if (len > 0 && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
+
+            const bool binary = (nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL || nd->op == GGML_OP_DIV);
+            const ggml_tensor * a = nd->src[0];
+            const ggml_tensor * b = binary ? nd->src[1] : nullptr;
+
+            if (!chain_ok_tensor(a) || (binary && !chain_ok_tensor(b))) break;
+            const bool a_b = ggml_are_same_shape(a, nd) || ggml_nelements(a) == 1;
+            const bool b_b = !binary || (ggml_are_same_shape(b, nd) || ggml_nelements(b) == 1);
+            if (!a_b || !b_b) break;
+
+            const ggml_tensor * other = nullptr;
+            int chain_lhs = 1;
+
+            if (len == 0) {
+                if (ggml_nelements(a) != ggml_nelements(nd)) break;
+                head_src = a;
+                other = b;
+            } else {
+                if (a == prev) { other = b; chain_lhs = 1; }
+                else if (binary && b == prev) { other = a; chain_lhs = 0; }
+                else break;
+            }
+
+            if (other) {
+                bool is_intermediate = false;
+                for (int k = i; k < j; ++k) {
+                    if (cgraph->nodes[k] == other) { is_intermediate = true; break; }
+                }
+                if (is_intermediate) break;
+            }
+
+            desc.bcast[len]        = other ? (ggml_nelements(other) == 1 ? 1 : 0) : 0;
+            desc.code[len]         = code;
+            desc.other[len]        = other ? (const float *) other->data : nullptr;
+            desc.chain_is_lhs[len] = chain_lhs;
+            desc.p0[len]           = p0;
+            desc.p1[len]           = p1;
+            len++;
+            prev = nd;
+        }
+    }
+
+    if (len >= 2) {
+        ggml_tensor * out = cgraph->nodes[i + len - 1];
+        ggml_op ops_ch[TQ_CHAIN_MAX_OPS];
+        for (int k = 0; k < len; ++k) {
+            ops_ch[k] = cgraph->nodes[i + k]->op;
+        }
+        const int out_ch[1] = { i + len - 1 };
+
+        bool pure_run = (ops_ch[0] == GGML_OP_ADD || ops_ch[0] == GGML_OP_MUL);
+        for (int k = 0; k < len && pure_run; ++k) {
+            const ggml_tensor * nd = cgraph->nodes[i + k];
+            pure_run = nd->op == ops_ch[0] && !desc.bcast[k] && (k == 0 || desc.chain_is_lhs[k]) &&
+                       ggml_are_same_layout(nd->src[1], cgraph->nodes[i]->src[1]);
+        }
+        if (pure_run) {
+            return -1;
+        }
+
+        // An exact in-place operand is safe; a shifted overlap or broadcast alias is not.
+        bool alias_veto = false;
+        const char * db = (const char *) out->data;
+        const size_t dn = ggml_nbytes(out);
+        auto overlaps = [&](const void * ptr, size_t n) {
+            const char * ob = (const char *) ptr;
+            return ob < db + dn && db < ob + n;
+        };
+        auto exact = [&](const void * ptr, size_t n) {
+            return ptr == (const void *) db && n == dn;
+        };
+        if (overlaps(head_src->data, ggml_nbytes(head_src)) && !exact(head_src->data, ggml_nbytes(head_src))) {
+            alias_veto = true;
+        }
+        for (int k = 0; k < len && !alias_veto; ++k) {
+            if (!desc.other[k]) continue;
+            const ggml_tensor * nd = cgraph->nodes[i + k];
+            const ggml_tensor * ot = desc.chain_is_lhs[k] ? nd->src[1] : nd->src[0];
+            const size_t on = ggml_nbytes(ot);
+            if (desc.bcast[k]) {
+                alias_veto |= overlaps(ot->data, on);
+            } else {
+                alias_veto |= overlaps(ot->data, on) && !exact(ot->data, on);
+            }
+        }
+
+        if (!alias_veto && ggml_are_same_shape(out, cgraph->nodes[i]) &&
+                ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
+            desc.n_ops = len;
+            ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
+                                    (float *) out->data, ggml_nelements(out), desc);
+            return len - 1;
+        }
+    }
+    return -1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3612,6 +3760,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    {
+        const int n_fused = ggml_cuda_fuse_elem_chain(*cuda_ctx, cgraph, i);
+        if (n_fused >= 0) {
+            return n_fused;
         }
     }
 
@@ -4062,7 +4217,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-        for (const bool with_bias : { false, true }) {
+        for (const bool with_bias : { true, false }) {
             const int n_ops = op == GGML_OP_MUL_MAT ? (with_bias ? 3 : 2) : (with_bias ? 6 : 5);
             const int out_nodes[] = { i + n_ops - 1 };
             ggml_op ops[6];

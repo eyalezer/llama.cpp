@@ -6769,6 +6769,54 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+struct test_elem_chain_fusion : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool with_gelu_softplus;
+    const bool self_mul;
+
+    test_elem_chain_fusion(std::array<int64_t, 4> ne, bool with_gelu_softplus, bool self_mul = false)
+        : ne(ne), with_gelu_softplus(with_gelu_softplus), self_mul(self_mul) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_gelu_softplus, self_mul);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ELEM_CHAIN_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * o1 = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * s  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(o1, "o1");
+        ggml_set_name(s, "s");
+
+        ggml_tensor * cur = ggml_silu(ctx, x);
+        if (self_mul) {
+            cur = ggml_mul(ctx, cur, cur);
+            cur = ggml_add(ctx, cur, x);
+            ggml_set_name(cur, "out");
+            return cur;
+        }
+        cur = ggml_mul(ctx, cur, o1);
+        cur = ggml_add(ctx, cur, x);
+        cur = ggml_add(ctx, cur, s);
+        if (with_gelu_softplus) {
+            cur = ggml_gelu(ctx, cur);
+            cur = ggml_softplus(ctx, cur);
+        }
+        cur = ggml_scale(ctx, cur, 0.5f);
+        cur = ggml_clamp(ctx, cur, -4.0f, 4.0f);
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -9303,6 +9351,9 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
     std::default_random_engine rng(0);
 
     // unary ops

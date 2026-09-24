@@ -789,6 +789,39 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+struct mmvf_narrow_band {
+    int64_t min;
+    int64_t max;
+};
+
+static mmvf_narrow_band ggml_cuda_mmvf_narrow_band(const int cc, const enum ggml_type type) {
+    mmvf_narrow_band band = { 0, 4096 };
+
+    if (GGML_CUDA_CC_IS_CDNA(cc)) {
+        band = type == GGML_TYPE_F16 ? mmvf_narrow_band{ 8, 1024 } : mmvf_narrow_band{ 0, 2048 };
+    } else if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        band = { 0, 2048 };
+    } else if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        band = type == GGML_TYPE_F16 ? mmvf_narrow_band{ 0, 128 } : mmvf_narrow_band{ 0, 256 };
+    }
+
+    static const char * env_min = getenv("GGML_MMVF_NARROW_MIN");
+    static const char * env_max = getenv("GGML_MMVF_NARROW_MAX");
+    if (env_min) {
+        band.min = atoll(env_min);
+    }
+    if (env_max) {
+        band.max = atoll(env_max);
+    }
+
+    return band;
+}
+
+static bool ggml_cuda_mmvf_weight_is_narrow(const int cc, const enum ggml_type type, const int64_t ne01) {
+    const mmvf_narrow_band band = ggml_cuda_mmvf_narrow_band(cc, type);
+    return ne01 >= band.min && ne01 <= band.max;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -818,6 +851,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_F32, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
@@ -838,6 +874,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp16_mma_hardware_available(cc)) {
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_F16, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
                     }
@@ -864,6 +903,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
+                    if (ggml_cuda_mmvf_weight_is_narrow(cc, GGML_TYPE_BF16, src0_ne[1])) {
+                        return ne11 <= 8;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
